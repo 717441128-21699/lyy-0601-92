@@ -329,6 +329,7 @@ export class GoalCalculationManager {
       targetWeightUnit: weightGoal.unit,
       weeklyWeightChange: weightGoal.weeklyChange,
       mealFrequency: options?.customMealFrequency || 3,
+      dietGoal: profile.dietGoal || DietGoal.MAINTAIN,
       exerciseMinutes: options?.exerciseMinutes,
       sleepHours: options?.sleepHours,
       macronutrientRatio: {

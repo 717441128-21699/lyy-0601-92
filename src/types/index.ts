@@ -94,6 +94,34 @@ export interface NutritionFacts {
   iron?: number;
 }
 
+export interface ServingInfo {
+  size: number;
+  unit: UnitType;
+  name: string;
+  grams: number;
+}
+
+export interface CupInfo {
+  size: number;
+  unit: UnitType;
+  grams: number;
+  description?: string;
+}
+
+export interface CookingConversion {
+  rawToCookedRatio: number;
+  cookingMethod: string;
+  nutritionRetentionRate: number;
+}
+
+export interface FoodConversionInfo {
+  nutritionPer100g: NutritionFacts;
+  servingInfo?: ServingInfo;
+  cupInfo?: CupInfo;
+  cookingConversion?: CookingConversion;
+  ediblePortion: number;
+}
+
 export interface FoodItem {
   id: string;
   name: string;
@@ -104,6 +132,7 @@ export interface FoodItem {
   allergens?: AllergenType[];
   tags?: string[];
   isFavorite?: boolean;
+  conversionInfo?: FoodConversionInfo;
 }
 
 export interface MealFoodEntry {
@@ -188,6 +217,7 @@ export interface UserGoals {
   targetWeightUnit: UnitType;
   weeklyWeightChange: number;
   mealFrequency: number;
+  dietGoal: DietGoal;
   exerciseMinutes?: number;
   sleepHours?: number;
   macronutrientRatio: {
@@ -262,6 +292,56 @@ export interface WeeklyReport {
   abnormalFluctuations: { date: number; weightChange: number; description: string; possibleReasons: string[] }[];
   weeklySummary: string;
   suggestions: string[];
+}
+
+export interface TrendComparison {
+  currentValue: number;
+  previousValue: number;
+  change: number;
+  changePercent: number;
+  direction: 'up' | 'down' | 'stable';
+  description: string;
+}
+
+export interface HealthScoreBreakdown {
+  nutrition: number;
+  water: number;
+  weight: number;
+  consistency: number;
+  total: number;
+}
+
+export interface TrendAnalysis {
+  period: {
+    currentStart: number;
+    currentEnd: number;
+    previousStart: number;
+    previousEnd: number;
+  };
+  calories: TrendComparison;
+  protein: TrendComparison;
+  water: TrendComparison;
+  weight: TrendComparison;
+  healthScore: HealthScoreBreakdown;
+  weeklyComparison: {
+    currentWeek: {
+      averageDailyCalories: number;
+      averageDailyProtein: number;
+      averageDailyWater: number;
+      averageWeight: number;
+      checkInDays: number;
+      completeDays: number;
+    };
+    previousWeek: {
+      averageDailyCalories: number;
+      averageDailyProtein: number;
+      averageDailyWater: number;
+      averageWeight: number;
+      checkInDays: number;
+      completeDays: number;
+    };
+  };
+  insights: string[];
 }
 
 export interface MonthlyReport {

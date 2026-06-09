@@ -9,6 +9,7 @@ import {
   generateId,
   convertUnit,
   calculateNutritionForQuantity,
+  calculateFoodNutrition,
   roundTo,
 } from '../utils/helpers';
 
@@ -223,17 +224,10 @@ export class FoodEstimationManager {
     quantity: number,
     unit: UnitType
   ): Promise<NutritionFacts> {
-    let targetQuantity = quantity;
-
-    if (unit !== food.servingUnit) {
-      try {
-        targetQuantity = convertUnit(quantity, unit, food.servingUnit, this.customConversionRates);
-      } catch {
-        console.warn(`Cannot convert ${unit} to ${food.servingUnit}, using original quantity`);
-      }
-    }
-
-    return calculateNutritionForQuantity(food.nutritionFacts, food.servingSize, targetQuantity);
+    const result = calculateFoodNutrition(food, quantity, unit, {
+      customRates: this.customConversionRates,
+    });
+    return result.nutrition;
   }
 
   async quickEstimate(

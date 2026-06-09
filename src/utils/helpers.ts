@@ -1,5 +1,5 @@
 import dayjs from 'dayjs';
-import { UnitType, UnitConversionRate, NutritionFacts, DesensitizeOptions, UserProfile } from '../types';
+import { UnitType, UnitConversionRate, NutritionFacts, DesensitizeOptions, UserProfile, FoodItem } from '../types';
 
 const WEIGHT_UNITS = new Set([
   UnitType.GRAM,
@@ -174,6 +174,139 @@ export const calculateNutritionForQuantity = (
   };
 };
 
+export const normalizeTo100gNutrition = (
+  nutrition: NutritionFacts,
+  servingSize: number,
+  servingUnit: UnitType
+): NutritionFacts => {
+  let grams = servingSize;
+  if (servingUnit === UnitType.KILOGRAM) {
+    grams = servingSize * 1000;
+  } else if (servingUnit === UnitType.POUND) {
+    grams = servingSize * 453.592;
+  } else if (servingUnit === UnitType.OUNCE) {
+    grams = servingSize * 28.3495;
+  } else if (servingUnit === UnitType.CUP) {
+    grams = servingSize * 240;
+  }
+
+  return calculateNutritionForQuantity(nutrition, grams, 100);
+};
+
+export const calculateFoodNutrition = (
+  food: FoodItem,
+  quantity: number,
+  unit: UnitType,
+  options?: {
+    isCooked?: boolean;
+    useEdiblePortion?: boolean;
+    customRates?: UnitConversionRate[];
+  }
+): {
+  nutrition: NutritionFacts;
+  normalizedQuantityGrams: number;
+  conversionDetails: {
+    used100gBase: boolean;
+    appliedCookingConversion: boolean;
+    appliedEdiblePortion: boolean;
+    ediblePortionUsed?: number;
+  };
+} => {
+  const { isCooked = false, useEdiblePortion = true, customRates = [] } = options || {};
+  let targetGrams: number;
+  let baseNutrition: NutritionFacts;
+  let baseGrams = 100;
+  let used100gBase = false;
+  let appliedCookingConversion = false;
+  let appliedEdiblePortion = false;
+  let ediblePortionUsed: number | undefined;
+
+  if (unit === UnitType.GRAM) {
+    targetGrams = quantity;
+  } else if (unit === UnitType.KILOGRAM) {
+    targetGrams = quantity * 1000;
+  } else if (unit === UnitType.POUND) {
+    targetGrams = quantity * 453.592;
+  } else if (unit === UnitType.OUNCE) {
+    targetGrams = quantity * 28.3495;
+  } else if (unit === UnitType.CUP) {
+    if (food.conversionInfo?.cupInfo) {
+      targetGrams = quantity * food.conversionInfo.cupInfo.grams;
+    } else {
+      targetGrams = quantity * 240;
+    }
+  } else if (unit === UnitType.PIECE && food.conversionInfo?.servingInfo) {
+    targetGrams = quantity * food.conversionInfo.servingInfo.grams;
+  } else {
+    try {
+      targetGrams = convertUnit(quantity, unit, UnitType.GRAM, customRates);
+    } catch {
+      targetGrams = quantity;
+    }
+  }
+
+  if (food.conversionInfo) {
+    baseNutrition = food.conversionInfo.nutritionPer100g;
+    baseGrams = 100;
+    used100gBase = true;
+
+    if (isCooked && food.conversionInfo.cookingConversion) {
+      targetGrams = targetGrams / food.conversionInfo.cookingConversion.rawToCookedRatio;
+      appliedCookingConversion = true;
+    }
+
+    if (useEdiblePortion && food.conversionInfo.ediblePortion > 0 && food.conversionInfo.ediblePortion <= 100) {
+      const ediblePortionRatio = food.conversionInfo.ediblePortion / 100;
+      targetGrams = targetGrams * ediblePortionRatio;
+      appliedEdiblePortion = true;
+      ediblePortionUsed = food.conversionInfo.ediblePortion;
+    }
+  } else {
+    baseNutrition = food.nutritionFacts;
+    if (food.servingUnit === UnitType.GRAM) {
+      baseGrams = food.servingSize;
+    } else if (food.servingUnit === UnitType.KILOGRAM) {
+      baseGrams = food.servingSize * 1000;
+    } else if (food.servingUnit === UnitType.POUND) {
+      baseGrams = food.servingSize * 453.592;
+    } else if (food.servingUnit === UnitType.OUNCE) {
+      baseGrams = food.servingSize * 28.3495;
+    } else if (food.servingUnit === UnitType.CUP) {
+      const cupInfo = (food as any).cupInfo;
+      if (cupInfo && cupInfo.gramsPerCup) {
+        baseGrams = food.servingSize * cupInfo.gramsPerCup;
+      } else {
+        baseGrams = food.servingSize * 240;
+      }
+    } else {
+      baseGrams = food.servingSize;
+    }
+  }
+
+  const nutrition = calculateNutritionForQuantity(baseNutrition, baseGrams, targetGrams);
+
+  if (food.conversionInfo?.cookingConversion && isCooked && appliedCookingConversion) {
+    const retentionRate = food.conversionInfo.cookingConversion.nutritionRetentionRate;
+    Object.keys(nutrition).forEach(key => {
+      const k = key as keyof NutritionFacts;
+      if (nutrition[k] !== undefined && typeof nutrition[k] === 'number') {
+        (nutrition[k] as number) = roundTo((nutrition[k] as number) * retentionRate, 2);
+      }
+    });
+  }
+
+  return {
+    nutrition,
+    normalizedQuantityGrams: roundTo(targetGrams, 2),
+    conversionDetails: {
+      used100gBase,
+      appliedCookingConversion,
+      appliedEdiblePortion,
+      ediblePortionUsed,
+    },
+  };
+};
+
 export const sumNutrition = (nutritions: NutritionFacts[]): NutritionFacts => {
   return nutritions.reduce((acc, curr) => ({
     calories: acc.calories + curr.calories,
@@ -342,10 +475,19 @@ export const desensitizeWeightRecord = (
   return result;
 };
 
-export const desensitizeWeeklyReport = (
+const maskWeightValues = (text: string): string => {
+  return text
+    .replace(/[+-]?\s*[\d.]+\s*(kg|千克|公斤|斤|磅|lb)/g, 'XX$1')
+    .replace(/体重(增加|减少|变化)[\d.]+/g, '体重$1XX')
+    .replace(/(增重|减重)[\d.]+/g, '$1XX');
+};
+
+export const desensitizeReport = (
   report: any,
   options: DesensitizeOptions = {}
 ): any => {
+  if (!report) return report;
+  
   const result = { ...report };
   
   if (options.maskUserId !== false) {
@@ -354,19 +496,39 @@ export const desensitizeWeeklyReport = (
   
   if (options.maskWeight) {
     result.weightTrend = report.weightTrend.map((w: number) => 
-      w > 0 ? roundTo(w, 0) : 0
+      w > 0 ? Math.round(w) : 0
     );
-    result.weightChange = roundTo(result.weightChange, 0);
+    result.weightChange = Math.round(result.weightChange);
     
-    result.abnormalFluctuations = report.abnormalFluctuations.map((f: any) => ({
-      ...f,
-      weightChange: roundTo(f.weightChange, 0),
-      description: f.description.replace(/[\d.]+kg/g, 'XXkg'),
-    }));
+    if (result.abnormalFluctuations) {
+      result.abnormalFluctuations = report.abnormalFluctuations.map((f: any) => ({
+        ...f,
+        weightChange: Math.round(f.weightChange),
+        description: maskWeightValues(f.description),
+      }));
+    }
+    
+    if (result.weeklySummary) {
+      result.weeklySummary = maskWeightValues(result.weeklySummary);
+    }
+    
+    if (result.summary) {
+      result.summary = maskWeightValues(result.summary);
+    }
+    
+    if (result.suggestions) {
+      result.suggestions = result.suggestions.map((s: string) => maskWeightValues(s));
+    }
+    
+    if (result.weightComparison) {
+      result.weightComparison = maskWeightValues(result.weightComparison);
+    }
   }
   
   return result;
 };
+
+export const desensitizeWeeklyReport = desensitizeReport;
 
 export const roundTo = (value: number, decimals: number = 2): number => {
   const factor = Math.pow(10, decimals);

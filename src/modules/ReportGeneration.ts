@@ -2,11 +2,13 @@ import {
   WeeklyReport,
   MealRecord,
   WeightRecord,
+  WaterRecord,
   UserGoals,
   UserProfile,
   SDKConfig,
   MealType,
   UnitType,
+  DietGoal,
 } from '../types';
 import {
   getTimestamp,
@@ -22,8 +24,9 @@ import {
   normalizeVolumeToMl,
   normalizeWeightToKg,
   desensitizeWeeklyReport,
+  desensitizeReport,
 } from '../utils/helpers';
-import type { DesensitizeOptions, MonthlyReport } from '../types';
+import type { DesensitizeOptions, MonthlyReport, TrendAnalysis, TrendComparison } from '../types';
 
 export class ReportGenerationManager {
   private config: SDKConfig;
@@ -617,14 +620,14 @@ export class ReportGenerationManager {
     desensitizeOptions?: DesensitizeOptions
   ): Promise<string> {
     const finalReport = desensitizeOptions 
-      ? desensitizeWeeklyReport(report, desensitizeOptions) 
+      ? desensitizeReport(report, desensitizeOptions) 
       : report;
 
     if (format === 'json') {
       return JSON.stringify(finalReport, null, 2);
     }
 
-    const lines: string[] = [];
+    let lines: string[] = [];
     lines.push('=== 健康报告 ===');
     lines.push(`周期: ${formatDate(finalReport.startDate)} - ${formatDate(finalReport.endDate)}`);
     lines.push(`平均每日热量: ${finalReport.averageDailyCalories} 大卡`);
@@ -638,6 +641,11 @@ export class ReportGenerationManager {
       lines.push('周总结: ' + finalReport.weeklySummary);
     }
 
+    if ('summary' in finalReport) {
+      lines.push('');
+      lines.push('月总结: ' + (finalReport as MonthlyReport).summary);
+    }
+
     if ('suggestions' in finalReport) {
       lines.push('');
       lines.push('建议:');
@@ -646,12 +654,28 @@ export class ReportGenerationManager {
       }
     }
 
+    if ('abnormalFluctuations' in finalReport && finalReport.abnormalFluctuations) {
+      lines.push('');
+      lines.push('异常波动:');
+      for (const fluctuation of finalReport.abnormalFluctuations) {
+        lines.push(`- ${fluctuation.description}`);
+      }
+    }
+
     if (desensitizeOptions) {
       lines.push('');
       lines.push('* 本报告已进行数据脱敏处理');
     }
 
-    return lines.join('\n');
+    let text = lines.join('\n');
+    
+    if (desensitizeOptions?.maskWeight) {
+      text = text.replace(/[+-]?\s*[\d.]+\s*(kg|千克|公斤|斤|磅|lb)/g, 'XX$1');
+      text = text.replace(/体重(增加|减少|变化)[\d.]+/g, '体重$1XX');
+      text = text.replace(/(增重|减重)[\d.]+/g, '$1XX');
+    }
+
+    return text;
   }
 
   async exportDesensitizedReport(
@@ -716,6 +740,267 @@ export class ReportGenerationManager {
       checkInChange,
       improvements,
       areasToImprove,
+    };
+  }
+
+  private createTrendComparison(
+    currentValue: number,
+    previousValue: number,
+    metricName: string,
+    isHigherBetter: boolean
+  ): TrendComparison {
+    const change = currentValue - previousValue;
+    const changePercent = previousValue > 0 ? roundTo((change / previousValue) * 100, 1) : (currentValue > 0 ? 100 : 0);
+    
+    let direction: 'up' | 'down' | 'stable' = 'stable';
+    const thresholdPercent = 5;
+    
+    if (previousValue === 0 && currentValue > 0) {
+      direction = 'up';
+    } else if (previousValue > 0 && currentValue === 0) {
+      direction = 'down';
+    } else if (changePercent > thresholdPercent) {
+      direction = 'up';
+    } else if (changePercent < -thresholdPercent) {
+      direction = 'down';
+    }
+    
+    let description = '';
+    if (direction === 'stable') {
+      description = `${metricName}基本稳定，变化在合理范围内`;
+    } else if (direction === 'up') {
+      if (previousValue === 0) {
+        description = `${metricName}从无到有，开始记录`;
+      } else if (isHigherBetter) {
+        description = `${metricName}较上周期提升${changePercent}%，表现良好`;
+      } else {
+        description = `${metricName}较上周期增加${changePercent}%，需要注意控制`;
+      }
+    } else {
+      if (currentValue === 0) {
+        description = `${metricName}本周期未记录`;
+      } else if (isHigherBetter) {
+        description = `${metricName}较上周期下降${Math.abs(changePercent)}%，需要加强`;
+      } else {
+        description = `${metricName}较上周期下降${Math.abs(changePercent)}%，趋势良好`;
+      }
+    }
+    
+    return {
+      currentValue: roundTo(currentValue, 2),
+      previousValue: roundTo(previousValue, 2),
+      change: roundTo(change, 2),
+      changePercent,
+      direction,
+      description,
+    };
+  }
+
+  async analyzeTrend(
+    userId: string,
+    meals: MealRecord[],
+    weightRecords: WeightRecord[],
+    waterRecords: WaterRecord[],
+    goals: UserGoals,
+    options?: {
+      referenceDate?: number;
+      daysToCompare?: number;
+    }
+  ): Promise<TrendAnalysis> {
+    const { referenceDate = getTimestamp(), daysToCompare = 7 } = options || {};
+    const dayMs = 24 * 60 * 60 * 1000;
+    
+    const currentEnd = getEndOfDay(referenceDate);
+    const currentStart = getStartOfDay(currentEnd - (daysToCompare - 1) * dayMs);
+    const previousEnd = getEndOfDay(currentStart - dayMs);
+    const previousStart = getStartOfDay(previousEnd - (daysToCompare - 1) * dayMs);
+    
+    const currentMeals = meals.filter(m => m.timestamp >= currentStart && m.timestamp <= currentEnd);
+    const previousMeals = meals.filter(m => m.timestamp >= previousStart && m.timestamp <= previousEnd);
+    
+    const currentWeights = weightRecords.filter(w => w.timestamp >= currentStart && w.timestamp <= currentEnd);
+    const previousWeights = weightRecords.filter(w => w.timestamp >= previousStart && w.timestamp <= previousEnd);
+    
+    const currentWater = waterRecords.filter(w => w.timestamp >= currentStart && w.timestamp <= currentEnd);
+    const previousWater = waterRecords.filter(w => w.timestamp >= previousStart && w.timestamp <= previousEnd);
+    
+    const currentDaily = await this.calculateDailyNutrition(currentMeals, currentStart, currentEnd);
+    const previousDaily = await this.calculateDailyNutrition(previousMeals, previousStart, previousEnd);
+    
+    const currentAvg = averageNutrition(currentDaily);
+    const previousAvg = averageNutrition(previousDaily);
+    
+    const safeDivide = (sum: number, count: number): number => {
+      return count > 0 ? sum / count : 0;
+    };
+    
+    const currentAvgCalories = safeDivide(
+      currentDaily.reduce((sum, d) => sum + d.calories, 0),
+      currentDaily.length
+    );
+    const previousAvgCalories = safeDivide(
+      previousDaily.reduce((sum, d) => sum + d.calories, 0),
+      previousDaily.length
+    );
+    
+    const currentAvgProtein = safeDivide(
+      currentDaily.reduce((sum, d) => sum + (d.protein || 0), 0),
+      currentDaily.length
+    );
+    const previousAvgProtein = safeDivide(
+      previousDaily.reduce((sum, d) => sum + (d.protein || 0), 0),
+      previousDaily.length
+    );
+    
+    const currentAvgWaterMl = safeDivide(
+      currentWater.reduce((sum, w) => sum + w.normalizedAmountMl, 0),
+      daysToCompare
+    );
+    const previousAvgWaterMl = safeDivide(
+      previousWater.reduce((sum, w) => sum + w.normalizedAmountMl, 0),
+      daysToCompare
+    );
+    
+    const currentAvgWeight = safeDivide(
+      currentWeights.reduce((sum, w) => sum + w.normalizedWeightKg, 0),
+      currentWeights.length
+    );
+    const previousAvgWeight = safeDivide(
+      previousWeights.reduce((sum, w) => sum + w.normalizedWeightKg, 0),
+      previousWeights.length
+    );
+    
+    const caloriesComparison = this.createTrendComparison(
+      currentAvgCalories,
+      previousAvgCalories,
+      '热量摄入',
+      false
+    );
+    
+    const proteinComparison = this.createTrendComparison(
+      currentAvgProtein,
+      previousAvgProtein,
+      '蛋白质摄入',
+      true
+    );
+    
+    const waterComparison = this.createTrendComparison(
+      currentAvgWaterMl,
+      previousAvgWaterMl,
+      '饮水量',
+      true
+    );
+    
+    const weightComparison = this.createTrendComparison(
+      currentAvgWeight,
+      previousAvgWeight,
+      '体重',
+      false
+    );
+    
+    const currentCheckIn = this.calculateCheckInStatus(currentMeals, currentStart, currentEnd);
+    const previousCheckIn = this.calculateCheckInStatus(previousMeals, previousStart, previousEnd);
+    
+    const currentDailyDetails = this.calculateDailyCheckInDetails(currentMeals, currentStart, currentEnd, goals.mealFrequency);
+    const previousDailyDetails = this.calculateDailyCheckInDetails(previousMeals, previousStart, previousEnd, goals.mealFrequency);
+    
+    const currentCompleteDays = currentDailyDetails.filter(d => d.status === 'complete').length;
+    const previousCompleteDays = previousDailyDetails.filter(d => d.status === 'complete').length;
+    
+    let nutritionScore = 60;
+    const caloriePercent = goals.dailyCalories > 0 ? (currentAvgCalories / goals.dailyCalories) * 100 : 100;
+    
+    if (caloriesComparison.direction === 'stable') {
+      if (caloriePercent >= 90 && caloriePercent <= 110) {
+        nutritionScore = 90;
+      } else {
+        nutritionScore = 75;
+      }
+    } else if (
+      (caloriesComparison.direction === 'down' && currentAvgCalories > goals.dailyCalories) ||
+      (caloriesComparison.direction === 'up' && currentAvgCalories < goals.dailyCalories)
+    ) {
+      nutritionScore = 85;
+    }
+    nutritionScore = Math.min(100, Math.max(0, nutritionScore));
+    
+    let waterGoalMl = goals.dailyWater;
+    if (goals.waterUnit === UnitType.LITER) waterGoalMl *= 1000;
+    const waterScore = waterGoalMl > 0 ? Math.min(100, Math.max(0, roundTo((currentAvgWaterMl / waterGoalMl) * 100, 0))) : 70;
+    
+    const weightScore = weightComparison.direction === 'stable' ? 85 :
+      (weightComparison.direction === 'down' && goals.dietGoal === DietGoal.LOSE_WEIGHT) ? 90 :
+      (weightComparison.direction === 'up' && (goals.dietGoal === DietGoal.GAIN_WEIGHT || goals.dietGoal === DietGoal.BUILD_MUSCLE)) ? 90 : 70;
+    
+    const consistencyScore = Math.min(100, Math.max(0,
+      (currentCheckIn.checkInDays / daysToCompare) * 100
+    ));
+    
+    const totalScore = roundTo((nutritionScore + waterScore + weightScore + consistencyScore) / 4, 1);
+    
+    const insights: string[] = [];
+    
+    if (nutritionScore >= 80) {
+      insights.push('营养摄入控制良好，继续保持');
+    } else {
+      insights.push('需要更加注意营养均衡和热量控制');
+    }
+    
+    if (waterScore >= 80) {
+      insights.push('饮水量充足，继续保持');
+    } else {
+      insights.push('饮水量不足，建议每天至少喝够8杯水');
+    }
+    
+    if (consistencyScore >= 80) {
+      insights.push('打卡坚持度很高，非常棒');
+    } else {
+      insights.push('打卡频率可以再提升一些，坚持就是胜利');
+    }
+    
+    if (currentCompleteDays > previousCompleteDays) {
+      insights.push(`完整打卡天数比上周增加${currentCompleteDays - previousCompleteDays}天，进步明显`);
+    } else if (currentCompleteDays < previousCompleteDays) {
+      insights.push(`完整打卡天数比上周减少${previousCompleteDays - currentCompleteDays}天，需要加油`);
+    }
+    
+    return {
+      period: {
+        currentStart,
+        currentEnd,
+        previousStart,
+        previousEnd,
+      },
+      calories: caloriesComparison,
+      protein: proteinComparison,
+      water: waterComparison,
+      weight: weightComparison,
+      healthScore: {
+        nutrition: roundTo(nutritionScore, 1),
+        water: roundTo(waterScore, 1),
+        weight: roundTo(weightScore, 1),
+        consistency: roundTo(consistencyScore, 1),
+        total: totalScore,
+      },
+      weeklyComparison: {
+        currentWeek: {
+          averageDailyCalories: roundTo(currentAvgCalories, 1),
+          averageDailyProtein: roundTo(currentAvgProtein, 1),
+          averageDailyWater: roundTo(currentAvgWaterMl, 1),
+          averageWeight: roundTo(currentAvgWeight, 2),
+          checkInDays: currentCheckIn.checkInDays,
+          completeDays: currentCompleteDays,
+        },
+        previousWeek: {
+          averageDailyCalories: roundTo(previousAvgCalories, 1),
+          averageDailyProtein: roundTo(previousAvgProtein, 1),
+          averageDailyWater: roundTo(previousAvgWaterMl, 1),
+          averageWeight: roundTo(previousAvgWeight, 2),
+          checkInDays: previousCheckIn.checkInDays,
+          completeDays: previousCompleteDays,
+        },
+      },
+      insights,
     };
   }
 }

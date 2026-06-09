@@ -6,11 +6,12 @@ import { NutritionSummaryManager } from './modules/NutritionSummary';
 import { GoalCalculationManager } from './modules/GoalCalculation';
 import { ReminderRulesManager } from './modules/ReminderRules';
 import { ReportGenerationManager } from './modules/ReportGeneration';
-import { convertUnit } from './utils/helpers';
+import { convertUnit, getEndOfDay } from './utils/helpers';
 
 export * from './types';
 export * from './utils/helpers';
 export * from './adapters/InMemoryStorageAdapter';
+export { desensitizeReport } from './utils/helpers';
 
 export class HealthNutritionSDK {
   private config: SDKConfig;
@@ -172,6 +173,38 @@ export class HealthNutritionSDK {
     );
   }
 
+  async generateMonthlyReport(userId: string, monthOffset: number = 0): Promise<import('./types').MonthlyReport | null> {
+    const profile = await this.userProfile.getProfile(userId);
+    const goals = await this.goalCalculation.getGoals(userId);
+
+    if (!profile || !goals) return null;
+
+    const now = Date.now();
+    const targetDate = new Date(now);
+    targetDate.setMonth(targetDate.getMonth() - monthOffset);
+    const monthEnd = getEndOfDay(targetDate.getTime());
+    const monthStart = new Date(targetDate.getFullYear(), targetDate.getMonth(), 1).getTime();
+
+    const meals = await this.mealRecords.getMealsByDateRange(userId, monthStart - 30 * 24 * 60 * 60 * 1000, monthEnd);
+    const weightRecords = await this.mealRecords.getWeightRecords(userId, monthStart - 30 * 24 * 60 * 60 * 1000, monthEnd);
+    const waterRecords = await this.mealRecords.getWaterRecords(userId, monthStart, monthEnd);
+
+    const formattedWater = waterRecords.map(r => ({
+      date: r.timestamp,
+      amount: r.amount,
+      unit: r.unit,
+    }));
+
+    return this.reportGeneration.generateMonthlyReport(
+      userId,
+      profile,
+      goals,
+      meals,
+      weightRecords,
+      formattedWater
+    );
+  }
+
   async checkTodayAlerts(
     userId: string
   ): Promise<{
@@ -239,6 +272,29 @@ export class HealthNutritionSDK {
     toUnit: import('./types').UnitType
   ): number {
     return convertUnit(value, fromUnit, toUnit);
+  }
+
+  async analyzeTrend(
+    userId: string,
+    options?: {
+      referenceDate?: number;
+      daysToCompare?: number;
+    }
+  ): Promise<import('./types').TrendAnalysis | null> {
+    const profile = await this.userProfile.getProfile(userId);
+    const goals = await this.goalCalculation.getGoals(userId);
+    
+    if (!profile || !goals) return null;
+    
+    const { referenceDate = Date.now(), daysToCompare = 7 } = options || {};
+    const dayMs = 24 * 60 * 60 * 1000;
+    const startDate = referenceDate - (daysToCompare * 2) * dayMs;
+    
+    const meals = await this.mealRecords.getMealsByDateRange(userId, startDate, referenceDate);
+    const weights = await this.mealRecords.getWeightRecords(userId, startDate, referenceDate);
+    const water = await this.mealRecords.getWaterRecords(userId, startDate, referenceDate);
+    
+    return this.reportGeneration.analyzeTrend(userId, meals, weights, water, goals, options);
   }
 }
 

@@ -14,6 +14,7 @@ import {
   generateId,
   getTimestamp,
   calculateNutritionForQuantity,
+  calculateFoodNutrition,
   sumNutrition,
   getStartOfDay,
   getEndOfDay,
@@ -44,16 +45,19 @@ export class MealRecordsManager {
   async createMealRecord(
     userId: string,
     mealType: MealType,
-    foods: { food: FoodItem; quantity: number; unit: UnitType }[],
+    foods: { food: FoodItem; quantity: number; unit: UnitType; isCooked?: boolean }[],
     options?: { timestamp?: number; notes?: string; mood?: string; location?: string }
   ): Promise<MealRecord> {
     const now = getTimestamp();
-    const foodEntries: MealFoodEntry[] = foods.map(({ food, quantity, unit }) => {
+    const foodEntries: MealFoodEntry[] = foods.map(({ food, quantity, unit, isCooked }) => {
       let normalizedQuantity = quantity;
       let normalizedUnit = unit;
       
+      const nutritionResult = calculateFoodNutrition(food, quantity, unit, { isCooked });
+      const nutrition = nutritionResult.nutrition;
+      
       if (isWeightUnit(unit) && isWeightUnit(food.servingUnit)) {
-        normalizedQuantity = roundTo(normalizeWeightToGrams(quantity, unit), 2);
+        normalizedQuantity = nutritionResult.normalizedQuantityGrams;
         normalizedUnit = UnitType.GRAM;
       } else if (isVolumeUnit(unit) && isVolumeUnit(food.servingUnit)) {
         normalizedQuantity = roundTo(normalizeVolumeToMl(quantity, unit), 2);
@@ -63,16 +67,13 @@ export class MealRecordsManager {
           normalizedQuantity = roundTo(convertUnit(quantity, unit, food.servingUnit), 2);
           normalizedUnit = food.servingUnit;
         } catch {
-          normalizedQuantity = quantity;
-          normalizedUnit = unit;
+          normalizedQuantity = nutritionResult.normalizedQuantityGrams;
+          normalizedUnit = UnitType.GRAM;
         }
+      } else {
+        normalizedQuantity = quantity;
+        normalizedUnit = unit;
       }
-      
-      const nutrition = calculateNutritionForQuantity(
-        food.nutritionFacts,
-        food.servingSize,
-        normalizedQuantity
-      );
       
       return {
         foodId: food.id,
@@ -127,7 +128,7 @@ export class MealRecordsManager {
     userId: string,
     mealId: string,
     updates: {
-      foods?: { food: FoodItem; quantity: number; unit: UnitType }[];
+      foods?: { food: FoodItem; quantity: number; unit: UnitType; isCooked?: boolean }[];
       mealType?: MealType;
       timestamp?: number;
       notes?: string;
@@ -142,12 +143,15 @@ export class MealRecordsManager {
     let totalNutrition = meal.totalNutrition;
 
     if (updates.foods) {
-      foodEntries = updates.foods.map(({ food, quantity, unit }) => {
+      foodEntries = updates.foods.map(({ food, quantity, unit, isCooked }) => {
         let normalizedQuantity = quantity;
         let normalizedUnit = unit;
         
+        const nutritionResult = calculateFoodNutrition(food, quantity, unit, { isCooked });
+        const nutrition = nutritionResult.nutrition;
+        
         if (isWeightUnit(unit) && isWeightUnit(food.servingUnit)) {
-          normalizedQuantity = roundTo(normalizeWeightToGrams(quantity, unit), 2);
+          normalizedQuantity = nutritionResult.normalizedQuantityGrams;
           normalizedUnit = UnitType.GRAM;
         } else if (isVolumeUnit(unit) && isVolumeUnit(food.servingUnit)) {
           normalizedQuantity = roundTo(normalizeVolumeToMl(quantity, unit), 2);
@@ -157,16 +161,11 @@ export class MealRecordsManager {
             normalizedQuantity = roundTo(convertUnit(quantity, unit, food.servingUnit), 2);
             normalizedUnit = food.servingUnit;
           } catch {
-            normalizedQuantity = quantity;
-            normalizedUnit = unit;
+            normalizedQuantity = nutritionResult.normalizedQuantityGrams;
+            normalizedUnit = UnitType.GRAM;
           }
         }
         
-        const nutrition = calculateNutritionForQuantity(
-          food.nutritionFacts,
-          food.servingSize,
-          normalizedQuantity
-        );
         return {
           foodId: food.id,
           foodName: food.name,
@@ -254,7 +253,8 @@ export class MealRecordsManager {
     mealId: string,
     food: FoodItem,
     quantity: number,
-    unit: UnitType
+    unit: UnitType,
+    options?: { isCooked?: boolean }
   ): Promise<MealRecord | null> {
     const meal = await this.getMealRecord(userId, mealId);
     if (!meal) return null;
@@ -262,8 +262,11 @@ export class MealRecordsManager {
     let normalizedQuantity = quantity;
     let normalizedUnit = unit;
     
+    const nutritionResult = calculateFoodNutrition(food, quantity, unit, options);
+    const nutrition = nutritionResult.nutrition;
+    
     if (isWeightUnit(unit) && isWeightUnit(food.servingUnit)) {
-      normalizedQuantity = roundTo(normalizeWeightToGrams(quantity, unit), 2);
+      normalizedQuantity = nutritionResult.normalizedQuantityGrams;
       normalizedUnit = UnitType.GRAM;
     } else if (isVolumeUnit(unit) && isVolumeUnit(food.servingUnit)) {
       normalizedQuantity = roundTo(normalizeVolumeToMl(quantity, unit), 2);
@@ -273,16 +276,10 @@ export class MealRecordsManager {
         normalizedQuantity = roundTo(convertUnit(quantity, unit, food.servingUnit), 2);
         normalizedUnit = food.servingUnit;
       } catch {
-        normalizedQuantity = quantity;
-        normalizedUnit = unit;
+        normalizedQuantity = nutritionResult.normalizedQuantityGrams;
+        normalizedUnit = UnitType.GRAM;
       }
     }
-
-    const nutrition = calculateNutritionForQuantity(
-      food.nutritionFacts,
-      food.servingSize,
-      normalizedQuantity
-    );
 
     const foodEntry: MealFoodEntry = {
       foodId: food.id,
@@ -414,6 +411,30 @@ export class MealRecordsManager {
     };
   }
 
+  async getWaterIntakeByDateRange(userId: string, startDate: number, endDate: number): Promise<Array<{ date: number; totalMl: number; totalCups: number }>> {
+    const records = await this.getWaterRecords(userId, startDate, endDate);
+    const dailyData: Map<number, { totalMl: number; totalCups: number }> = new Map();
+
+    for (const record of records) {
+      const dayStart = getStartOfDay(record.timestamp);
+      const existing = dailyData.get(dayStart) || { totalMl: 0, totalCups: 0 };
+      existing.totalMl += record.normalizedAmountMl;
+      existing.totalCups += record.cups || 0;
+      dailyData.set(dayStart, existing);
+    }
+
+    const result: Array<{ date: number; totalMl: number; totalCups: number }> = [];
+    for (const [date, data] of dailyData) {
+      result.push({
+        date,
+        totalMl: roundTo(data.totalMl, 2),
+        totalCups: roundTo(data.totalCups, 1),
+      });
+    }
+
+    return result.sort((a, b) => a.date - b.date);
+  }
+
   async recordWeight(
     userId: string,
     weight: number,
@@ -533,15 +554,18 @@ export class MealRecordsManager {
   async createFoodCombination(
     userId: string,
     name: string,
-    foods: { food: FoodItem; quantity: number; unit: UnitType }[],
+    foods: { food: FoodItem; quantity: number; unit: UnitType; isCooked?: boolean }[],
     mealType: MealType
   ): Promise<FoodCombination> {
-    const foodEntries: MealFoodEntry[] = foods.map(({ food, quantity, unit }) => {
+    const foodEntries: MealFoodEntry[] = foods.map(({ food, quantity, unit, isCooked }) => {
       let normalizedQuantity = quantity;
       let normalizedUnit = unit;
       
+      const nutritionResult = calculateFoodNutrition(food, quantity, unit, { isCooked });
+      const nutrition = nutritionResult.nutrition;
+      
       if (isWeightUnit(unit) && isWeightUnit(food.servingUnit)) {
-        normalizedQuantity = roundTo(normalizeWeightToGrams(quantity, unit), 2);
+        normalizedQuantity = nutritionResult.normalizedQuantityGrams;
         normalizedUnit = UnitType.GRAM;
       } else if (isVolumeUnit(unit) && isVolumeUnit(food.servingUnit)) {
         normalizedQuantity = roundTo(normalizeVolumeToMl(quantity, unit), 2);
@@ -551,16 +575,11 @@ export class MealRecordsManager {
           normalizedQuantity = roundTo(convertUnit(quantity, unit, food.servingUnit), 2);
           normalizedUnit = food.servingUnit;
         } catch {
-          normalizedQuantity = quantity;
-          normalizedUnit = unit;
+          normalizedQuantity = nutritionResult.normalizedQuantityGrams;
+          normalizedUnit = UnitType.GRAM;
         }
       }
       
-      const nutrition = calculateNutritionForQuantity(
-        food.nutritionFacts,
-        food.servingSize,
-        normalizedQuantity
-      );
       return {
         foodId: food.id,
         foodName: food.name,

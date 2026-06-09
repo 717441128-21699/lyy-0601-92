@@ -54,18 +54,19 @@ export class UserProfileManager {
   }
 
   async getProfile(userId: string): Promise<UserProfile | null> {
-    const cached = this.profiles.get(userId);
-    if (cached) return cached;
-
     if (this.config.storageAdapter) {
       const profile = await this.config.storageAdapter.get<UserProfile>(`profile:${userId}`);
       if (profile) {
         this.profiles.set(userId, profile);
         return profile;
+      } else {
+        this.profiles.delete(userId);
+        return null;
       }
     }
 
-    return null;
+    const cached = this.profiles.get(userId);
+    return cached || null;
   }
 
   async updateProfile(userId: string, updates: Partial<UserProfile>): Promise<UserProfile | null> {
