@@ -1,0 +1,33 @@
+{
+  "name": "health-nutrition-sdk",
+  "version": "1.0.0",
+  "description": "健康管理类库 SDK - 处理饮食、饮水和体重目标相关能力",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "health",
+    "nutrition",
+    "diet",
+    "weight",
+    "water",
+    "sdk"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "dayjs": "^1.11.10"
+  }
+}
