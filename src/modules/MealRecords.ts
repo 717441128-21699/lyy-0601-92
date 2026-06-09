@@ -9,6 +9,10 @@ import {
   UnitType,
   NutritionFacts,
   SDKConfig,
+  ValidationResult,
+  ValidationError,
+  BatchOperationResult,
+  DataQualityConfig,
 } from '../types';
 import {
   generateId,
@@ -28,6 +32,11 @@ import {
   isWeightUnit,
   isVolumeUnit,
   roundTo,
+  validateMealFoodEntry,
+  validateWaterRecord,
+  validateWeightRecord,
+  createBatchResult,
+  DEFAULT_DATA_QUALITY_CONFIG,
 } from '../utils/helpers';
 
 export class MealRecordsManager {
@@ -42,14 +51,47 @@ export class MealRecordsManager {
     this.config = config;
   }
 
+  private getDataQualityConfig(): Partial<DataQualityConfig> {
+    return {
+      ...DEFAULT_DATA_QUALITY_CONFIG,
+      ...this.config.dataQuality,
+    };
+  }
+
   async createMealRecord(
     userId: string,
     mealType: MealType,
     foods: { food: FoodItem; quantity: number; unit: UnitType; isCooked?: boolean }[],
-    options?: { timestamp?: number; notes?: string; mood?: string; location?: string }
+    options?: { timestamp?: number; notes?: string; mood?: string; location?: string; validate?: boolean }
   ): Promise<MealRecord> {
     const now = getTimestamp();
-    const foodEntries: MealFoodEntry[] = foods.map(({ food, quantity, unit, isCooked }) => {
+    const dqConfig = this.getDataQualityConfig();
+    const shouldValidate = options?.validate ?? dqConfig.enableValidation ?? true;
+    
+    const validationResults: ValidationResult[] = [];
+    const processedFoods = foods.map(foodItem => {
+      if (shouldValidate) {
+        const validation = validateMealFoodEntry(
+          foodItem.food,
+          foodItem.quantity,
+          foodItem.unit,
+          dqConfig
+        );
+        validationResults.push(validation);
+        
+        if (!validation.isValid && dqConfig.rejectOnError) {
+          const errorMessages = validation.errors.map(e => e.message).join('; ');
+          throw new Error(`数据校验失败: ${errorMessages}`);
+        }
+        
+        if (validation.correctedData && dqConfig.autoCorrectWarnings) {
+          return { ...foodItem, ...validation.correctedData };
+        }
+      }
+      return foodItem;
+    });
+
+    const foodEntries: MealFoodEntry[] = processedFoods.map(({ food, quantity, unit, isCooked }) => {
       let normalizedQuantity = quantity;
       let normalizedUnit = unit;
       
@@ -340,19 +382,42 @@ export class MealRecordsManager {
     userId: string,
     amount: number,
     unit: UnitType = UnitType.MILLILITER,
-    options?: { timestamp?: number; cupSize?: number }
+    options?: { timestamp?: number; cupSize?: number; validate?: boolean }
   ): Promise<WaterRecord> {
-    const normalizedAmountMl = roundTo(normalizeVolumeToMl(amount, unit), 2);
+    const dqConfig = this.getDataQualityConfig();
+    const shouldValidate = options?.validate ?? dqConfig.enableValidation ?? true;
+    const timestamp = options?.timestamp || getTimestamp();
+    
+    let processedAmount = amount;
+    let processedUnit = unit;
+    let processedTimestamp = timestamp;
+    
+    if (shouldValidate) {
+      const validation = validateWaterRecord(amount, unit, { timestamp, config: dqConfig });
+      
+      if (!validation.isValid && dqConfig.rejectOnError) {
+        const errorMessages = validation.errors.map(e => e.message).join('; ');
+        throw new Error(`数据校验失败: ${errorMessages}`);
+      }
+      
+      if (validation.correctedData && dqConfig.autoCorrectWarnings) {
+        processedAmount = validation.correctedData.amount;
+        processedUnit = validation.correctedData.unit;
+        processedTimestamp = validation.correctedData.timestamp;
+      }
+    }
+    
+    const normalizedAmountMl = roundTo(normalizeVolumeToMl(processedAmount, processedUnit), 2);
     const cupSize = options?.cupSize || 240;
     const cups = calculateCupsFromMl(normalizedAmountMl, cupSize);
     
     const record: WaterRecord = {
       id: generateId(),
       userId,
-      amount,
-      unit,
+      amount: processedAmount,
+      unit: processedUnit,
       normalizedAmountMl,
-      timestamp: options?.timestamp || getTimestamp(),
+      timestamp: processedTimestamp,
       cupSize,
       cups,
     };
@@ -446,17 +511,41 @@ export class MealRecordsManager {
       muscleMass?: number;
       waterWeight?: number;
       boneMass?: number;
+      validate?: boolean;
     }
   ): Promise<WeightRecord> {
-    const normalizedWeightKg = roundTo(normalizeWeightToKg(weight, unit), 2);
+    const dqConfig = this.getDataQualityConfig();
+    const shouldValidate = options?.validate ?? dqConfig.enableValidation ?? true;
+    const timestamp = options?.timestamp || getTimestamp();
+    
+    let processedWeight = weight;
+    let processedUnit = unit;
+    let processedTimestamp = timestamp;
+    
+    if (shouldValidate) {
+      const validation = validateWeightRecord(weight, unit, { timestamp, config: dqConfig });
+      
+      if (!validation.isValid && dqConfig.rejectOnError) {
+        const errorMessages = validation.errors.map(e => e.message).join('; ');
+        throw new Error(`数据校验失败: ${errorMessages}`);
+      }
+      
+      if (validation.correctedData && dqConfig.autoCorrectWarnings) {
+        processedWeight = validation.correctedData.weight;
+        processedUnit = validation.correctedData.unit;
+        processedTimestamp = validation.correctedData.timestamp;
+      }
+    }
+    
+    const normalizedWeightKg = roundTo(normalizeWeightToKg(processedWeight, processedUnit), 2);
     
     const record: WeightRecord = {
       id: generateId(),
       userId,
-      weight,
-      unit,
+      weight: processedWeight,
+      unit: processedUnit,
       normalizedWeightKg,
-      timestamp: options?.timestamp || getTimestamp(),
+      timestamp: processedTimestamp,
       note: options?.note,
       bodyFat: options?.bodyFat,
       muscleMass: options?.muscleMass,
@@ -737,5 +826,150 @@ export class MealRecordsManager {
       .map(([foodId, data]) => ({ foodId, ...data }))
       .sort((a, b) => b.count - a.count)
       .slice(0, limit);
+  }
+
+  async batchCreateMealRecords(
+    userId: string,
+    mealData: Array<{
+      mealType: MealType;
+      foods: { food: FoodItem; quantity: number; unit: UnitType; isCooked?: boolean }[];
+      options?: { timestamp?: number; notes?: string; mood?: string; location?: string };
+    }>
+  ): Promise<BatchOperationResult<MealRecord>> {
+    const dqConfig = this.getDataQualityConfig();
+    
+    const result = await createBatchResult(mealData, async (item, index) => {
+      const allErrors: ValidationError[] = [];
+      const allWarnings: ValidationError[] = [];
+      
+      for (const foodItem of item.foods) {
+        const validation = validateMealFoodEntry(
+          foodItem.food,
+          foodItem.quantity,
+          foodItem.unit,
+          dqConfig
+        );
+        allErrors.push(...validation.errors);
+        allWarnings.push(...validation.warnings);
+      }
+      
+      if (allErrors.length > 0) {
+        return {
+          valid: false,
+          errors: allErrors,
+          warnings: allWarnings,
+        };
+      }
+      
+      try {
+        const meal = await this.createMealRecord(userId, item.mealType, item.foods, {
+          ...item.options,
+          validate: false,
+        });
+        return { valid: true, errors: [], warnings: allWarnings, data: meal, id: meal.id };
+      } catch (error: any) {
+        return {
+          valid: false,
+          errors: [{
+            code: 'INVALID_QUANTITY',
+            severity: 'error',
+            field: 'meal',
+            message: error.message,
+            suggestion: '请检查数据后重试',
+            currentValue: item,
+          }],
+          warnings: [],
+        };
+      }
+    });
+
+    return result;
+  }
+
+  async batchRecordWater(
+    userId: string,
+    waterData: Array<{ amount: number; unit?: UnitType; timestamp?: number }>
+  ): Promise<BatchOperationResult<WaterRecord>> {
+    const dqConfig = this.getDataQualityConfig();
+    
+    const result = await createBatchResult(waterData, async (item, index) => {
+      const unit = item.unit || UnitType.MILLILITER;
+      const validation = validateWaterRecord(item.amount, unit, { timestamp: item.timestamp, config: dqConfig });
+      
+      if (!validation.isValid) {
+        return {
+          valid: false,
+          errors: validation.errors,
+          warnings: validation.warnings,
+        };
+      }
+      
+      try {
+        const record = await this.recordWater(userId, item.amount, unit, {
+          timestamp: item.timestamp,
+          validate: false,
+        });
+        return { valid: true, errors: [], warnings: validation.warnings, data: record, id: record.id };
+      } catch (error: any) {
+        return {
+          valid: false,
+          errors: [{
+            code: 'INVALID_QUANTITY',
+            severity: 'error',
+            field: 'water',
+            message: error.message,
+            suggestion: '请检查数据后重试',
+            currentValue: item,
+          }],
+          warnings: [],
+        };
+      }
+    });
+
+    return result;
+  }
+
+  async batchRecordWeight(
+    userId: string,
+    weightData: Array<{ weight: number; unit?: UnitType; timestamp?: number; note?: string }>
+  ): Promise<BatchOperationResult<WeightRecord>> {
+    const dqConfig = this.getDataQualityConfig();
+    
+    const result = await createBatchResult(weightData, async (item, index) => {
+      const unit = item.unit || UnitType.KILOGRAM;
+      const validation = validateWeightRecord(item.weight, unit, { timestamp: item.timestamp, config: dqConfig });
+      
+      if (!validation.isValid) {
+        return {
+          valid: false,
+          errors: validation.errors,
+          warnings: validation.warnings,
+        };
+      }
+      
+      try {
+        const record = await this.recordWeight(userId, item.weight, unit, {
+          timestamp: item.timestamp,
+          note: item.note,
+          validate: false,
+        });
+        return { valid: true, errors: [], warnings: validation.warnings, data: record, id: record.id };
+      } catch (error: any) {
+        return {
+          valid: false,
+          errors: [{
+            code: 'INVALID_QUANTITY',
+            severity: 'error',
+            field: 'weight',
+            message: error.message,
+            suggestion: '请检查数据后重试',
+            currentValue: item,
+          }],
+          warnings: [],
+        };
+      }
+    });
+
+    return result;
   }
 }

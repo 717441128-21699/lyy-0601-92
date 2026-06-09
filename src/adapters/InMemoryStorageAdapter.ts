@@ -1,4 +1,7 @@
-import { StorageAdapter } from '../types';
+import { 
+  StorageAdapter, 
+  ConflictResolutionStrategy,
+} from '../types';
 
 export interface StorageExportData {
   version: number;
@@ -6,6 +9,34 @@ export interface StorageExportData {
   data: Record<string, any>;
   exportedAt: number;
   count: number;
+  sinceTimestamp?: number;
+  timestamps?: Record<string, number>;
+  isIncremental?: boolean;
+}
+
+export interface ImportOptions {
+  overwrite?: boolean;
+  migrateFromVersion?: number;
+  conflictResolution?: ConflictResolutionStrategy;
+  dryRun?: boolean;
+  userId?: string;
+}
+
+export interface RollbackSnapshot {
+  token: string;
+  timestamp: number;
+  namespace: string;
+  version: number;
+  data: Record<string, { value: any; timestamp: number }>;
+  userId?: string;
+}
+
+export interface StorageIncrementalExportOptions {
+  sinceTimestamp?: number;
+  includeOldVersions?: boolean;
+  filter?: (key: string) => boolean;
+  userId?: string;
+  recordTypes?: Array<'meal' | 'water' | 'weight' | 'profile' | 'favorite' | 'combination'>;
 }
 
 export interface MigrationResult {
@@ -20,10 +51,13 @@ export type MigrationFn = (key: string, value: any) => { key: string; value: any
 
 export class InMemoryStorageAdapter implements StorageAdapter {
   private static sharedStorage: Map<string, any> = new Map();
+  private static sharedTimestamps: Map<string, number> = new Map();
   private static versionRegistry: Map<string, number> = new Map();
   private static migrations: Map<string, Map<number, MigrationFn>> = new Map();
+  private static rollbackSnapshots: Map<string, RollbackSnapshot> = new Map();
 
   private storage: Map<string, any>;
+  private timestamps: Map<string, number>;
   private useShared: boolean;
   private namespace: string;
   private version: number;
@@ -38,6 +72,7 @@ export class InMemoryStorageAdapter implements StorageAdapter {
     this.namespace = namespace;
     this.version = version;
     this.storage = useShared ? InMemoryStorageAdapter.sharedStorage : new Map();
+    this.timestamps = useShared ? InMemoryStorageAdapter.sharedTimestamps : new Map();
 
     if (useShared) {
       const existingVersion = InMemoryStorageAdapter.versionRegistry.get(namespace);
@@ -106,11 +141,13 @@ export class InMemoryStorageAdapter implements StorageAdapter {
   async set<T>(key: string, value: T): Promise<void> {
     const namespacedKey = this.getNamespacedKey(key);
     this.storage.set(namespacedKey, JSON.parse(JSON.stringify(value)));
+    this.timestamps.set(namespacedKey, Date.now());
   }
 
   async remove(key: string): Promise<void> {
     const namespacedKey = this.getNamespacedKey(key);
     this.storage.delete(namespacedKey);
+    this.timestamps.delete(namespacedKey);
   }
 
   async list<T>(prefix: string): Promise<T[]> {
@@ -200,20 +237,43 @@ export class InMemoryStorageAdapter implements StorageAdapter {
     return this.getAllNamespaceKeys(false).length;
   }
 
-  async exportData(options?: {
-    includeOldVersions?: boolean;
-    filter?: (key: string) => boolean;
-  }): Promise<StorageExportData> {
-    const { includeOldVersions = false, filter } = options || {};
+  async exportData(options?: StorageIncrementalExportOptions): Promise<StorageExportData> {
+    const { includeOldVersions = false, filter, sinceTimestamp, userId, recordTypes } = options || {};
     const data: Record<string, any> = {};
+    const timestamps: Record<string, number> = {};
     const keys = this.getAllNamespaceKeys(includeOldVersions);
 
     for (const namespacedKey of keys) {
       const originalKey = this.stripNamespace(namespacedKey);
-      if (!filter || filter(originalKey)) {
-        const value = this.storage.get(namespacedKey);
-        if (value !== undefined) {
-          data[originalKey] = JSON.parse(JSON.stringify(value));
+      
+      if (userId && !originalKey.includes(`:${userId}`) && !originalKey.includes(`${userId}:`)) {
+        continue;
+      }
+      
+      if (recordTypes && recordTypes.length > 0) {
+        const keyType = originalKey.split(':')[0];
+        if (!recordTypes.includes(keyType as any)) {
+          continue;
+        }
+      }
+      
+      if (sinceTimestamp) {
+        const ts = this.timestamps.get(namespacedKey) || 0;
+        if (ts < sinceTimestamp) {
+          continue;
+        }
+      }
+      
+      if (filter && !filter(originalKey)) {
+        continue;
+      }
+      
+      const value = this.storage.get(namespacedKey);
+      if (value !== undefined) {
+        data[originalKey] = JSON.parse(JSON.stringify(value));
+        const ts = this.timestamps.get(namespacedKey);
+        if (ts !== undefined) {
+          timestamps[originalKey] = ts;
         }
       }
     }
@@ -224,43 +284,268 @@ export class InMemoryStorageAdapter implements StorageAdapter {
       data,
       exportedAt: Date.now(),
       count: Object.keys(data).length,
+      sinceTimestamp,
+      timestamps,
+      isIncremental: sinceTimestamp !== undefined,
     };
   }
 
   async importData(
     exportData: StorageExportData,
-    options?: {
-      overwrite?: boolean;
-      migrateFromVersion?: number;
-    }
-  ): Promise<{ imported: number; skipped: number; migrated: number }> {
-    const { overwrite = false, migrateFromVersion } = options || {};
+    options?: ImportOptions
+  ): Promise<{ 
+    imported: number; 
+    skipped: number; 
+    migrated: number;
+    conflicts: Array<{ key: string; strategy: string; mergedValue?: any }>;
+    rollbackToken?: string;
+  }> {
+    const { 
+      overwrite = false, 
+      migrateFromVersion,
+      conflictResolution = 'last_write_wins',
+      dryRun = false,
+      userId,
+    } = options || {};
+    
     let imported = 0;
     let skipped = 0;
     let migrated = 0;
+    const conflicts: Array<{ key: string; strategy: string; mergedValue?: any }> = [];
+    const snapshotData: Record<string, { value: any; timestamp: number }> = {};
 
     for (const [key, value] of Object.entries(exportData.data)) {
-      const exists = await this.has(key);
-      
-      if (exists && !overwrite) {
-        skipped++;
+      if (userId && !key.includes(`:${userId}`) && !key.includes(`${userId}:`)) {
         continue;
       }
+      
+      const namespacedKey = this.getNamespacedKey(key);
+      const exists = await this.has(key);
+      const existingValue = exists ? await this.get<any>(key) : null;
+      const existingTimestamp = existingValue ? (this.timestamps.get(namespacedKey) || 0) : 0;
+      const importTimestamp = exportData.timestamps?.[key] || exportData.exportedAt;
 
-      let finalValue = value;
+      if (exists && !overwrite) {
+        const mergedResult = this.resolveConflict(
+          key,
+          existingValue,
+          value,
+          existingTimestamp,
+          importTimestamp,
+          conflictResolution
+        );
+
+        if (mergedResult.action === 'skip') {
+          skipped++;
+          conflicts.push({ key, strategy: conflictResolution });
+          continue;
+        }
+
+        if (mergedResult.action === 'merge') {
+          conflicts.push({ key, strategy: conflictResolution, mergedValue: mergedResult.value });
+        }
+      }
+
+      let finalValue = exists && !overwrite 
+        ? (this.resolveConflict(
+            key, existingValue, value, existingTimestamp, importTimestamp, conflictResolution
+          ).value || value)
+        : value;
+      
       if (migrateFromVersion !== undefined && migrateFromVersion !== this.version) {
-        const migratedResult = await this.migrateKey(key, value, migrateFromVersion, this.version);
+        const migratedResult = await this.migrateKey(key, finalValue, migrateFromVersion, this.version);
         if (migratedResult) {
           finalValue = migratedResult.value;
           migrated++;
         }
       }
 
-      await this.set(key, finalValue);
+      if (!dryRun) {
+        if (existingValue !== null) {
+          snapshotData[key] = {
+            value: existingValue,
+            timestamp: existingTimestamp || Date.now(),
+          };
+        }
+        await this.set(key, finalValue);
+      }
       imported++;
     }
 
-    return { imported, skipped, migrated };
+    let rollbackToken: string | undefined;
+    if (!dryRun && Object.keys(snapshotData).length > 0) {
+      rollbackToken = `rollback_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const snapshot: RollbackSnapshot = {
+        token: rollbackToken,
+        timestamp: Date.now(),
+        namespace: this.namespace,
+        version: this.version,
+        data: snapshotData,
+        userId,
+      };
+      InMemoryStorageAdapter.rollbackSnapshots.set(rollbackToken, snapshot);
+    }
+
+    return { imported, skipped, migrated, conflicts, rollbackToken };
+  }
+
+  private resolveConflict(
+    key: string,
+    existingValue: any,
+    newValue: any,
+    existingTimestamp: number,
+    newTimestamp: number,
+    strategy: ConflictResolutionStrategy
+  ): { action: 'keep' | 'replace' | 'merge' | 'skip'; value?: any } {
+    switch (strategy) {
+      case 'last_write_wins':
+        return newTimestamp >= existingTimestamp 
+          ? { action: 'replace', value: newValue }
+          : { action: 'keep', value: existingValue };
+      
+      case 'first_write_wins':
+        return existingTimestamp >= newTimestamp
+          ? { action: 'keep', value: existingValue }
+          : { action: 'replace', value: newValue };
+      
+      case 'merge_by_timestamp':
+        if (existingValue && newValue && typeof existingValue === 'object' && typeof newValue === 'object') {
+          const merged = { ...existingValue, ...newValue };
+          if (existingTimestamp > newTimestamp) {
+            Object.assign(merged, existingValue);
+          }
+          return { action: 'merge', value: merged };
+        }
+        return { action: 'keep', value: existingValue };
+      
+      case 'keep_higher_quantity':
+        if (existingValue?.quantity !== undefined && newValue?.quantity !== undefined) {
+          return existingValue.quantity >= newValue.quantity
+            ? { action: 'keep', value: existingValue }
+            : { action: 'replace', value: newValue };
+        }
+        return { action: 'keep', value: existingValue };
+      
+      case 'keep_more_recent_nutrition':
+        if (existingValue?.totalNutrition && newValue?.totalNutrition) {
+          return newTimestamp >= existingTimestamp
+            ? { action: 'replace', value: newValue }
+            : { action: 'keep', value: existingValue };
+        }
+        return { action: 'keep', value: existingValue };
+      
+      case 'manual':
+      default:
+        return { action: 'skip' };
+    }
+  }
+
+  async createRollbackSnapshot(userId?: string): Promise<string> {
+    const snapshotData: Record<string, { value: any; timestamp: number }> = {};
+    const keys = this.getAllNamespaceKeys(false);
+
+    for (const namespacedKey of keys) {
+      const originalKey = this.stripNamespace(namespacedKey);
+      if (userId && !originalKey.includes(`:${userId}`) && !originalKey.includes(`${userId}:`)) {
+        continue;
+      }
+      
+      const value = this.storage.get(namespacedKey);
+      if (value !== undefined) {
+        snapshotData[originalKey] = {
+          value: JSON.parse(JSON.stringify(value)),
+          timestamp: this.timestamps.get(namespacedKey) || Date.now(),
+        };
+      }
+    }
+
+    const token = `snapshot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const snapshot: RollbackSnapshot = {
+      token,
+      timestamp: Date.now(),
+      namespace: this.namespace,
+      version: this.version,
+      data: snapshotData,
+      userId,
+    };
+    InMemoryStorageAdapter.rollbackSnapshots.set(token, snapshot);
+    
+    return token;
+  }
+
+  async rollback(token: string): Promise<{ 
+    success: boolean; 
+    restoredCount: number;
+    message: string;
+  }> {
+    const snapshot = InMemoryStorageAdapter.rollbackSnapshots.get(token);
+    if (!snapshot) {
+      return { success: false, restoredCount: 0, message: '回滚快照不存在或已过期' };
+    }
+
+    if (snapshot.namespace !== this.namespace || snapshot.version !== this.version) {
+      return { 
+        success: false, 
+        restoredCount: 0, 
+        message: '快照命名空间或版本不匹配' 
+      };
+    }
+
+    let restoredCount = 0;
+    for (const [key, entry] of Object.entries(snapshot.data)) {
+      await this.set(key, entry.value);
+      const namespacedKey = this.getNamespacedKey(key);
+      this.timestamps.set(namespacedKey, entry.timestamp);
+      restoredCount++;
+    }
+
+    return {
+      success: true,
+      restoredCount,
+      message: `成功回滚 ${restoredCount} 条记录`,
+    };
+  }
+
+  async rollbackUserData(userId: string, toTimestamp?: number): Promise<{
+    success: boolean;
+    restoredCount: number;
+    deletedCount: number;
+    message: string;
+  }> {
+    const userKeys = await this.getUserKeys(userId);
+    let restoredCount = 0;
+    let deletedCount = 0;
+
+    for (const originalKey of userKeys) {
+      const namespacedKey = this.getNamespacedKey(originalKey);
+      const ts = this.timestamps.get(namespacedKey) || Date.now();
+
+      if (toTimestamp !== undefined && ts > toTimestamp) {
+        await this.remove(originalKey);
+        deletedCount++;
+      }
+    }
+
+    return {
+      success: true,
+      restoredCount,
+      deletedCount,
+      message: toTimestamp !== undefined
+        ? `已清除 ${deletedCount} 条 ${new Date(toTimestamp).toLocaleDateString()} 之后的用户数据`
+        : `回滚操作完成`,
+    };
+  }
+
+  async listRollbackSnapshots(userId?: string): Promise<RollbackSnapshot[]> {
+    const snapshots: RollbackSnapshot[] = [];
+    for (const snapshot of InMemoryStorageAdapter.rollbackSnapshots.values()) {
+      if (snapshot.namespace === this.namespace && snapshot.version === this.version) {
+        if (!userId || snapshot.userId === userId) {
+          snapshots.push(snapshot);
+        }
+      }
+    }
+    return snapshots.sort((a, b) => b.timestamp - a.timestamp);
   }
 
   async findAvailableVersions(): Promise<number[]> {

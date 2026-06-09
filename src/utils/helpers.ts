@@ -1,5 +1,19 @@
 import dayjs from 'dayjs';
-import { UnitType, UnitConversionRate, NutritionFacts, DesensitizeOptions, UserProfile, FoodItem } from '../types';
+import { 
+  UnitType, 
+  UnitConversionRate, 
+  NutritionFacts, 
+  DesensitizeOptions, 
+  UserProfile, 
+  FoodItem,
+  ValidationResult,
+  ValidationError,
+  ValidationErrorCode,
+  DataQualityConfig,
+  BatchOperationResult,
+  WeightTrendDescription,
+  DesensitizedWeightInfo,
+} from '../types';
 
 const WEIGHT_UNITS = new Set([
   UnitType.GRAM,
@@ -230,8 +244,13 @@ export const calculateFoodNutrition = (
   } else if (unit === UnitType.OUNCE) {
     targetGrams = quantity * 28.3495;
   } else if (unit === UnitType.CUP) {
-    if (food.conversionInfo?.cupInfo) {
-      targetGrams = quantity * food.conversionInfo.cupInfo.grams;
+    const cupInfo = food.conversionInfo?.cupInfo;
+    const legacyCupInfo = (food as any).cupInfo;
+    
+    if (cupInfo && cupInfo.grams) {
+      targetGrams = quantity * cupInfo.grams;
+    } else if (legacyCupInfo && legacyCupInfo.gramsPerCup) {
+      targetGrams = quantity * legacyCupInfo.gramsPerCup;
     } else {
       targetGrams = quantity * 240;
     }
@@ -255,11 +274,12 @@ export const calculateFoodNutrition = (
       appliedCookingConversion = true;
     }
 
-    if (useEdiblePortion && food.conversionInfo.ediblePortion > 0 && food.conversionInfo.ediblePortion <= 100) {
-      const ediblePortionRatio = food.conversionInfo.ediblePortion / 100;
+    const ediblePortion = food.conversionInfo.ediblePortion;
+    if (useEdiblePortion && ediblePortion !== undefined && ediblePortion > 0 && ediblePortion <= 100) {
+      const ediblePortionRatio = ediblePortion / 100;
       targetGrams = targetGrams * ediblePortionRatio;
       appliedEdiblePortion = true;
-      ediblePortionUsed = food.conversionInfo.ediblePortion;
+      ediblePortionUsed = ediblePortion;
     }
   } else {
     baseNutrition = food.nutritionFacts;
@@ -367,7 +387,10 @@ export const averageNutrition = (nutritions: NutritionFacts[]): NutritionFacts =
   };
 };
 
-const maskString = (str: string, visibleStart: number = 1, visibleEnd: number = 1): string => {
+const maskString = (str: string | undefined | null, visibleStart: number = 1, visibleEnd: number = 1): string => {
+  if (!str || typeof str !== 'string') {
+    return '***';
+  }
   if (str.length <= visibleStart + visibleEnd) {
     return '*'.repeat(str.length);
   }
@@ -495,15 +518,67 @@ export const desensitizeReport = (
   }
   
   if (options.maskWeight) {
-    result.weightTrend = report.weightTrend.map((w: number) => 
-      w > 0 ? Math.round(w) : 0
+    const goalDirection = (report as any).goalDirection || 'stable';
+    const startWeight = report.weeklyComparison?.previousWeek?.averageWeight || report.startWeight || 70;
+    const endWeight = report.weeklyComparison?.currentWeek?.averageWeight || report.endWeight || 70;
+    const weightChange = endWeight - startWeight;
+    const days = report.period?.days || 14;
+    
+    const desensitizedWeight = createDesensitizedWeightInfo(
+      weightChange,
+      startWeight,
+      endWeight,
+      days,
+      goalDirection
     );
-    result.weightChange = Math.round(result.weightChange);
+    
+    result.desensitizedWeightInfo = desensitizedWeight;
+    
+    if (result.weightTrend) {
+      result.weightTrend = {
+        description: desensitizedWeight.description,
+        direction: desensitizedWeight.direction,
+        trend: desensitizedWeight.trend,
+        changeCategory: desensitizedWeight.changeCategory,
+      };
+      delete result.weightChange;
+    }
+    
+    if (result.weightChange !== undefined) {
+      result.weightChange = {
+        description: desensitizedWeight.description,
+        direction: desensitizedWeight.direction,
+        changeCategory: desensitizedWeight.changeCategory,
+      };
+    }
+    
+    if (result.weeklyComparison) {
+      result.weeklyComparison = {
+        ...result.weeklyComparison,
+        currentWeek: {
+          ...result.weeklyComparison.currentWeek,
+          averageWeight: {
+            description: `本期平均体重${desensitizedWeight.direction === 'up' ? '略有上升' : desensitizedWeight.direction === 'down' ? '略有下降' : '基本稳定'}`,
+            direction: desensitizedWeight.direction,
+          },
+        },
+        previousWeek: {
+          ...result.weeklyComparison.previousWeek,
+          averageWeight: {
+            description: '上期平均体重',
+            direction: 'stable' as const,
+          },
+        },
+      };
+    }
     
     if (result.abnormalFluctuations) {
       result.abnormalFluctuations = report.abnormalFluctuations.map((f: any) => ({
         ...f,
-        weightChange: Math.round(f.weightChange),
+        weightChange: {
+          description: '体重有异常波动',
+          direction: f.weightChange > 0 ? 'up' : f.weightChange < 0 ? 'down' : 'stable',
+        },
         description: maskWeightValues(f.description),
       }));
     }
@@ -523,6 +598,18 @@ export const desensitizeReport = (
     if (result.weightComparison) {
       result.weightComparison = maskWeightValues(result.weightComparison);
     }
+    
+    if (result.weightAnalysis) {
+      result.weightAnalysis = {
+        ...result.weightAnalysis,
+        startWeight: null,
+        endWeight: null,
+        weightChange: null,
+        changePercent: null,
+        weeklyRate: null,
+        desensitizedInfo: desensitizedWeight,
+      };
+    }
   }
   
   return result;
@@ -537,6 +624,13 @@ export const roundTo = (value: number, decimals: number = 2): number => {
 
 export const clamp = (value: number, min: number, max: number): number => {
   return Math.min(Math.max(value, min), max);
+};
+
+export const safeDivide = (numerator: number, denominator: number, defaultValue: number = 0): number => {
+  if (denominator === 0 || !isFinite(denominator) || !isFinite(numerator)) {
+    return defaultValue;
+  }
+  return numerator / denominator;
 };
 
 export const calculateBMI = (weight: number, height: number, weightUnit: UnitType = UnitType.KILOGRAM, heightUnit: UnitType = UnitType.CENTIMETER): number => {
@@ -597,4 +691,531 @@ export const groupBy = <T, K extends keyof any>(array: T[], key: (item: T) => K)
     acc[groupKey].push(item);
     return acc;
   }, {} as Record<K, T[]>);
+};
+
+export const DEFAULT_DATA_QUALITY_CONFIG: DataQualityConfig = {
+  enableValidation: true,
+  rejectOnError: false,
+  autoCorrectWarnings: true,
+  maxFutureDays: 1,
+  maxPastDays: 365,
+  minQuantity: 0.1,
+  maxQuantity: 10000,
+  nutritionRanges: {
+    calories: { min: 0, max: 900, per100g: true },
+    protein: { min: 0, max: 100, per100g: true },
+    carbs: { min: 0, max: 100, per100g: true },
+    fat: { min: 0, max: 100, per100g: true },
+  },
+};
+
+const createValidationError = (
+  code: ValidationErrorCode,
+  field: string,
+  message: string,
+  suggestion: string,
+  currentValue: any,
+  severity: 'error' | 'warning' | 'info' = 'error',
+  expectedRange?: { min?: number; max?: number },
+  suggestedValue?: any
+): ValidationError => ({
+  code,
+  severity,
+  field,
+  message,
+  suggestion,
+  currentValue,
+  expectedRange,
+  suggestedValue,
+});
+
+export const validateUnit = (unit: UnitType, allowedUnits: UnitType[], field: string = 'unit'): ValidationError | null => {
+  if (!allowedUnits.includes(unit)) {
+    return createValidationError(
+      'INVALID_UNIT',
+      field,
+      `单位 ${unit} 不支持`,
+      `请使用以下单位之一: ${allowedUnits.join(', ')}`,
+      unit
+    );
+  }
+  return null;
+};
+
+export const validateQuantity = (
+  quantity: number,
+  field: string = 'quantity',
+  config: Partial<DataQualityConfig> = {}
+): ValidationError | null => {
+  const min = config.minQuantity ?? DEFAULT_DATA_QUALITY_CONFIG.minQuantity;
+  const max = config.maxQuantity ?? DEFAULT_DATA_QUALITY_CONFIG.maxQuantity;
+
+  if (typeof quantity !== 'number' || isNaN(quantity)) {
+    return createValidationError(
+      'INVALID_QUANTITY',
+      field,
+      '数量必须是有效数字',
+      '请输入有效的数字',
+      quantity
+    );
+  }
+
+  if (quantity <= 0) {
+    return createValidationError(
+      'INVALID_QUANTITY',
+      field,
+      '数量必须大于0',
+      `请输入大于0的数值，建议不小于 ${min}`,
+      quantity,
+      'error',
+      { min },
+      min
+    );
+  }
+
+  if (quantity < min) {
+    return createValidationError(
+      'INVALID_QUANTITY',
+      field,
+      `数量 ${quantity} 过小`,
+      `建议数量不小于 ${min}`,
+      quantity,
+      'warning',
+      { min },
+      min
+    );
+  }
+
+  if (quantity > max) {
+    return createValidationError(
+      'INVALID_QUANTITY',
+      field,
+      `数量 ${quantity} 过大`,
+      `建议数量不大于 ${max}`,
+      quantity,
+      'error',
+      { max },
+      max
+    );
+  }
+
+  return null;
+};
+
+export const validateTimestamp = (
+  timestamp: number,
+  field: string = 'timestamp',
+  config: Partial<DataQualityConfig> = {}
+): ValidationError | null => {
+  const now = Date.now();
+  const maxFutureDays = config.maxFutureDays ?? DEFAULT_DATA_QUALITY_CONFIG.maxFutureDays;
+  const maxPastDays = config.maxPastDays ?? DEFAULT_DATA_QUALITY_CONFIG.maxPastDays;
+
+  if (typeof timestamp !== 'number' || isNaN(timestamp) || timestamp <= 0) {
+    return createValidationError(
+      'INVALID_TIMESTAMP',
+      field,
+      '时间戳必须是有效数字',
+      '请输入有效的时间戳',
+      timestamp
+    );
+  }
+
+  const maxFutureTime = now + maxFutureDays * 24 * 60 * 60 * 1000;
+  if (timestamp > maxFutureTime) {
+    return createValidationError(
+      'INVALID_TIMESTAMP',
+      field,
+      '时间戳不能超过未来太久',
+      `请选择不超过 ${maxFutureDays} 天内的时间`,
+      timestamp,
+      'error',
+      { max: maxFutureTime }
+    );
+  }
+
+  const minPastTime = now - maxPastDays * 24 * 60 * 60 * 1000;
+  if (timestamp < minPastTime) {
+    return createValidationError(
+      'INVALID_TIMESTAMP',
+      field,
+      '时间戳太久远',
+      `请选择不超过 ${maxPastDays} 天内的时间`,
+      timestamp,
+      'error',
+      { min: minPastTime }
+    );
+  }
+
+  return null;
+};
+
+export const validateNutritionValues = (
+  nutrition: Partial<NutritionFacts>,
+  field: string = 'nutritionFacts',
+  config: Partial<DataQualityConfig> = {}
+): ValidationError[] => {
+  const errors: ValidationError[] = [];
+  const ranges = config.nutritionRanges ?? DEFAULT_DATA_QUALITY_CONFIG.nutritionRanges;
+
+  for (const [key, value] of Object.entries(nutrition)) {
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'number' || isNaN(value)) {
+      errors.push(createValidationError(
+        'INVALID_NUTRITION_VALUE',
+        `${field}.${key}`,
+        `${key} 必须是有效数字`,
+        '请输入有效的数字',
+        value
+      ));
+      continue;
+    }
+    if (value < 0) {
+      errors.push(createValidationError(
+        'INVALID_NUTRITION_VALUE',
+        `${field}.${key}`,
+        `${key} 不能为负数`,
+        '请输入非负数',
+        value,
+        'error',
+        { min: 0 }
+      ));
+      continue;
+    }
+    const range = ranges[key as keyof NutritionFacts];
+    if (range && value > range.max) {
+      errors.push(createValidationError(
+        'NUTRITION_IMBALANCED',
+        `${field}.${key}`,
+        `${key} ${value} 超出正常范围`,
+        `建议 ${key} 不超过 ${range.max}${range.per100g ? ' (每100g)' : ''}`,
+        value,
+        'warning',
+        { max: range.max }
+      ));
+    }
+  }
+
+  return errors;
+};
+
+export const validateMealFoodEntry = (
+  food: FoodItem,
+  quantity: number,
+  unit: UnitType,
+  config: Partial<DataQualityConfig> = {}
+): ValidationResult<{ food: FoodItem; quantity: number; unit: UnitType; isCooked?: boolean }> => {
+  const errors: ValidationError[] = [];
+  const warnings: ValidationError[] = [];
+
+  const unitError = validateUnit(unit, Object.values(UnitType), 'unit');
+  if (unitError) errors.push(unitError);
+
+  const quantityError = validateQuantity(quantity, 'quantity', config);
+  if (quantityError) {
+    if (quantityError.severity === 'error') {
+      errors.push(quantityError);
+    } else {
+      warnings.push(quantityError);
+    }
+  }
+
+  if (food.nutritionFacts) {
+    const nutritionErrors = validateNutritionValues(food.nutritionFacts, 'food.nutritionFacts', config);
+    for (const err of nutritionErrors) {
+      if (err.severity === 'error') {
+        errors.push(err);
+      } else {
+        warnings.push(err);
+      }
+    }
+  }
+
+  if (food.conversionInfo?.nutritionPer100g) {
+    const conversionErrors = validateNutritionValues(
+      food.conversionInfo.nutritionPer100g,
+      'food.conversionInfo.nutritionPer100g',
+      config
+    );
+    for (const err of conversionErrors) {
+      if (err.severity === 'error') {
+        errors.push(err);
+      } else {
+        warnings.push(err);
+      }
+    }
+  }
+
+  let correctedQuantity = quantity;
+  if (config.autoCorrectWarnings && warnings.length > 0) {
+    const min = config.minQuantity ?? DEFAULT_DATA_QUALITY_CONFIG.minQuantity;
+    const max = config.maxQuantity ?? DEFAULT_DATA_QUALITY_CONFIG.maxQuantity;
+    if (quantity < min) correctedQuantity = min;
+    if (quantity > max) correctedQuantity = max;
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    warnings,
+    correctedData: {
+      food,
+      quantity: correctedQuantity,
+      unit,
+    },
+  };
+};
+
+export const validateWaterRecord = (
+  amount: number,
+  unit: UnitType,
+  options?: {
+    timestamp?: number;
+    config?: Partial<DataQualityConfig>;
+  }
+): ValidationResult<{ amount: number; unit: UnitType; timestamp: number }> => {
+  const { timestamp = Date.now(), config = {} } = options || {};
+  const errors: ValidationError[] = [];
+  const warnings: ValidationError[] = [];
+
+  const waterUnits = [UnitType.MILLILITER, UnitType.LITER, UnitType.CUP];
+  const unitError = validateUnit(unit, waterUnits, 'unit');
+  if (unitError) errors.push(unitError);
+
+  let min: number, max: number;
+  if (unit === UnitType.LITER) {
+    min = 0.01;
+    max = 5;
+  } else if (unit === UnitType.CUP) {
+    min = 0.1;
+    max = 20;
+  } else {
+    min = 10;
+    max = 5000;
+  }
+
+  const amountError = validateQuantity(amount, 'amount', { ...config, minQuantity: min, maxQuantity: max });
+  if (amountError) {
+    if (amountError.severity === 'error') {
+      errors.push(amountError);
+    } else {
+      warnings.push(amountError);
+    }
+  }
+
+  const timeError = validateTimestamp(timestamp, 'timestamp', config);
+  if (timeError) {
+    if (timeError.severity === 'error') {
+      errors.push(timeError);
+    } else {
+      warnings.push(timeError);
+    }
+  }
+
+  let correctedAmount = amount;
+  let correctedTimestamp = timestamp;
+  if (config.autoCorrectWarnings && warnings.length > 0) {
+    if (amount < min) correctedAmount = min;
+    if (amount > max) correctedAmount = max;
+
+    const now = Date.now();
+    const maxFutureTime = now + (config.maxFutureDays ?? DEFAULT_DATA_QUALITY_CONFIG.maxFutureDays) * 24 * 60 * 60 * 1000;
+    if (timestamp > maxFutureTime) correctedTimestamp = now;
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    warnings,
+    correctedData: {
+      amount: correctedAmount,
+      unit,
+      timestamp: correctedTimestamp,
+    },
+  };
+};
+
+export const validateWeightRecord = (
+  weight: number,
+  unit: UnitType,
+  options?: {
+    timestamp?: number;
+    config?: Partial<DataQualityConfig>;
+  }
+): ValidationResult<{ weight: number; unit: UnitType; timestamp: number }> => {
+  const { timestamp = Date.now(), config = {} } = options || {};
+  const errors: ValidationError[] = [];
+  const warnings: ValidationError[] = [];
+
+  const weightUnits = [UnitType.KILOGRAM, UnitType.POUND, UnitType.OUNCE, UnitType.GRAM];
+  const unitError = validateUnit(unit, weightUnits, 'unit');
+  if (unitError) errors.push(unitError);
+
+  const weightConfig = { ...config, minQuantity: 20, maxQuantity: 300 };
+  if (unit === UnitType.POUND) {
+    weightConfig.minQuantity = 44;
+    weightConfig.maxQuantity = 660;
+  }
+  const weightError = validateQuantity(weight, 'weight', weightConfig);
+  if (weightError) {
+    if (weightError.severity === 'error') {
+      errors.push(weightError);
+    } else {
+      warnings.push(weightError);
+    }
+  }
+
+  const timeError = validateTimestamp(timestamp, 'timestamp', config);
+  if (timeError) {
+    if (timeError.severity === 'error') {
+      errors.push(timeError);
+    } else {
+      warnings.push(timeError);
+    }
+  }
+
+  let correctedWeight = weight;
+  let correctedTimestamp = timestamp;
+  if (config.autoCorrectWarnings && warnings.length > 0) {
+    const min = unit === UnitType.POUND ? 44 : 20;
+    const max = unit === UnitType.POUND ? 660 : 300;
+    if (weight < min) correctedWeight = min;
+    if (weight > max) correctedWeight = max;
+
+    const now = Date.now();
+    const maxFutureTime = now + (config.maxFutureDays ?? DEFAULT_DATA_QUALITY_CONFIG.maxFutureDays) * 24 * 60 * 60 * 1000;
+    if (timestamp > maxFutureTime) correctedTimestamp = now;
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    warnings,
+    correctedData: {
+      weight: correctedWeight,
+      unit,
+      timestamp: correctedTimestamp,
+    },
+  };
+};
+
+export const createBatchResult = async <T, R = T>(
+  items: T[],
+  validateFn: (item: T, index: number) => Promise<{ valid: boolean; errors: ValidationError[]; warnings: ValidationError[]; data?: R; id?: string }>
+): Promise<BatchOperationResult<R, T>> => {
+  const successful: Array<{ index: number; data: R; id?: string }> = [];
+  const failed: Array<{ index: number; data: T; errors: ValidationError[] }> = [];
+  const warnings: Array<{ index: number; data: R; warnings: ValidationError[] }> = [];
+  const results: Array<{
+    index: number;
+    valid: boolean;
+    data?: R;
+    input: T;
+    errors: ValidationError[];
+    warnings: ValidationError[];
+  }> = [];
+
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    const result = await validateFn(item, index);
+    
+    results.push({
+      index,
+      valid: result.valid,
+      data: result.data,
+      input: item,
+      errors: result.errors,
+      warnings: result.warnings,
+    });
+
+    if (result.valid && result.data !== undefined) {
+      successful.push({ index, data: result.data, id: result.id });
+      if (result.warnings.length > 0) {
+        warnings.push({ index, data: result.data, warnings: result.warnings });
+      }
+    } else {
+      failed.push({ index, data: item, errors: result.errors });
+    }
+  }
+
+  return {
+    successCount: successful.length,
+    failureCount: failed.length,
+    totalCount: items.length,
+    successful,
+    failed,
+    warnings,
+    results,
+  };
+};
+
+export const describeWeightTrend = (
+  weightChange: number,
+  days: number,
+  goalDirection: 'up' | 'down' | 'stable'
+): WeightTrendDescription => {
+  if (days < 3 || Math.abs(weightChange) < 0.1) {
+    return 'insufficient_data';
+  }
+
+  const weeklyChange = (weightChange / days) * 7;
+
+  if (Math.abs(weeklyChange) < 0.2) {
+    return 'maintaining_stable';
+  }
+
+  if (weeklyChange < 0) {
+    if (Math.abs(weeklyChange) <= 0.5) return 'slowly_losing';
+    if (Math.abs(weeklyChange) <= 1) return 'moderate_loss';
+    return 'significant_loss';
+  } else {
+    if (weeklyChange <= 0.5) return 'slowly_gaining';
+    if (weeklyChange <= 1) return 'moderate_gain';
+    return 'significant_gain';
+  }
+};
+
+export const getWeightChangeCategory = (weeklyChange: number): 'small' | 'moderate' | 'significant' => {
+  const absChange = Math.abs(weeklyChange);
+  if (absChange < 0.3) return 'small';
+  if (absChange < 0.8) return 'moderate';
+  return 'significant';
+};
+
+export const createDesensitizedWeightInfo = (
+  weightChange: number,
+  startWeight: number,
+  endWeight: number,
+  days: number,
+  goalDirection: 'up' | 'down' | 'stable'
+): DesensitizedWeightInfo => {
+  const trend = describeWeightTrend(weightChange, days, goalDirection);
+  
+  let direction: 'up' | 'down' | 'stable' = 'stable';
+  if (trend === 'slowly_losing' || trend === 'moderate_loss' || trend === 'significant_loss') {
+    direction = 'down';
+  } else if (trend === 'slowly_gaining' || trend === 'moderate_gain' || trend === 'significant_gain') {
+    direction = 'up';
+  }
+
+  const weeklyChange = days > 0 ? (weightChange / days) * 7 : 0;
+  const changeCategory = getWeightChangeCategory(weeklyChange);
+
+  const descriptions: Record<WeightTrendDescription, string> = {
+    maintaining_stable: '体重基本保持稳定',
+    slowly_losing: '体重呈缓慢下降趋势',
+    moderate_loss: '体重呈中度下降趋势',
+    significant_loss: '体重呈明显下降趋势',
+    slowly_gaining: '体重呈缓慢上升趋势',
+    moderate_gain: '体重呈中度上升趋势',
+    significant_gain: '体重呈明显上升趋势',
+    insufficient_data: '数据不足，暂无法判断体重趋势',
+  };
+
+  return {
+    trend,
+    direction,
+    description: descriptions[trend],
+    changeCategory,
+  };
 };

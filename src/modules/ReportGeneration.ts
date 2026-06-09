@@ -9,6 +9,9 @@ import {
   MealType,
   UnitType,
   DietGoal,
+  GoalExecutionAnalysis,
+  ExecutionInsight,
+  DesensitizedWeightInfo,
 } from '../types';
 import {
   getTimestamp,
@@ -25,6 +28,8 @@ import {
   normalizeWeightToKg,
   desensitizeWeeklyReport,
   desensitizeReport,
+  createDesensitizedWeightInfo,
+  safeDivide,
 } from '../utils/helpers';
 import type { DesensitizeOptions, MonthlyReport, TrendAnalysis, TrendComparison } from '../types';
 
@@ -632,7 +637,18 @@ export class ReportGenerationManager {
     lines.push(`周期: ${formatDate(finalReport.startDate)} - ${formatDate(finalReport.endDate)}`);
     lines.push(`平均每日热量: ${finalReport.averageDailyCalories} 大卡`);
     lines.push(`热量目标达成: ${finalReport.calorieGoalAchievement}%`);
-    lines.push(`体重变化: ${finalReport.weightChange >= 0 ? '+' : ''}${finalReport.weightChange} kg`);
+    
+    const weightChange = finalReport.weightChange;
+    if (typeof weightChange === 'number') {
+      lines.push(`体重变化: ${weightChange >= 0 ? '+' : ''}${roundTo(weightChange, 1)} kg`);
+    } else if (weightChange && typeof weightChange === 'object' && 'description' in weightChange) {
+      lines.push(`体重变化: ${weightChange.description}`);
+    } else if (finalReport.desensitizedWeightInfo) {
+      lines.push(`体重变化: ${finalReport.desensitizedWeightInfo.description}`);
+    } else {
+      lines.push(`体重变化: 暂无数据`);
+    }
+    
     lines.push(`打卡天数: ${finalReport.checkInDays} 天`);
     lines.push(`连续打卡: ${finalReport.checkInStreak} 天`);
 
@@ -1002,5 +1018,580 @@ export class ReportGenerationManager {
       },
       insights,
     };
+  }
+
+  async analyzeGoalExecution(
+    userId: string,
+    profile: UserProfile,
+    goals: UserGoals,
+    meals: MealRecord[],
+    weights: WeightRecord[],
+    waters: WaterRecord[],
+    options?: { startDate?: number; endDate?: number }
+  ): Promise<GoalExecutionAnalysis> {
+    const now = Date.now();
+    const endDate = options?.endDate || now;
+    const startDate = options?.startDate || getStartOfDay(endDate - 13 * 24 * 60 * 60 * 1000);
+    const days = Math.max(1, Math.ceil((endDate - startDate) / (24 * 60 * 60 * 1000)));
+
+    const periodMeals = meals.filter(m => m.timestamp >= startDate && m.timestamp <= endDate);
+    const periodWeights = weights.filter(w => w.timestamp >= startDate && w.timestamp <= endDate);
+    const periodWaters = waters.filter(w => w.timestamp >= startDate && w.timestamp <= endDate);
+
+    const checkInAnalysis = this.analyzeCheckIns(periodMeals, startDate, endDate, days);
+    const calorieAnalysis = this.analyzeCalories(periodMeals, goals, days);
+    const waterAnalysis = this.analyzeWater(periodWaters, goals, days);
+    const weightAnalysis = this.analyzeWeightTrend(periodWeights, profile, goals, startDate, endDate);
+
+    const hasEnoughData = checkInAnalysis.checkInDays > 0 || periodWeights.length > 0 || periodWaters.length > 0;
+    
+    const scoreComponents = [
+      checkInAnalysis.score,
+      calorieAnalysis.score,
+      waterAnalysis.score,
+      weightAnalysis.score,
+    ].filter(s => s !== null) as number[];
+
+    const overallScore = hasEnoughData && scoreComponents.length > 0
+      ? roundTo(scoreComponents.reduce((a, b) => a + b, 0) / scoreComponents.length, 1)
+      : 0;
+
+    const insights = this.generateExecutionInsights(
+      checkInAnalysis,
+      calorieAnalysis,
+      waterAnalysis,
+      weightAnalysis,
+      hasEnoughData
+    );
+
+    const summary = this.generateExecutionSummary(
+      checkInAnalysis,
+      calorieAnalysis,
+      waterAnalysis,
+      weightAnalysis,
+      hasEnoughData,
+      overallScore
+    );
+
+    const recommendations = this.generatePersonalizedRecommendations(
+      checkInAnalysis,
+      calorieAnalysis,
+      waterAnalysis,
+      weightAnalysis,
+      hasEnoughData
+    );
+
+    return {
+      period: { start: startDate, end: endDate, days },
+      overallScore,
+      insights,
+      checkInAnalysis: {
+        ...checkInAnalysis,
+        score: checkInAnalysis.score ?? 0,
+      },
+      calorieAnalysis: {
+        ...calorieAnalysis,
+        score: calorieAnalysis.score ?? 0,
+      },
+      waterAnalysis: {
+        ...waterAnalysis,
+        score: waterAnalysis.score ?? 0,
+      },
+      weightAnalysis: {
+        ...weightAnalysis,
+        score: weightAnalysis.score ?? 0,
+      },
+      summary,
+      personalizedRecommendations: recommendations,
+    };
+  }
+
+  private analyzeCheckIns(
+    meals: MealRecord[],
+    startDate: number,
+    endDate: number,
+    days: number
+  ) {
+    const mealDays = new Set<string>();
+    const completeMealDays = new Set<string>();
+    const mealTypeCounts: Record<MealType, Set<string>> = {
+      [MealType.BREAKFAST]: new Set(),
+      [MealType.LUNCH]: new Set(),
+      [MealType.DINNER]: new Set(),
+      [MealType.SNACK]: new Set(),
+    };
+
+    for (const meal of meals) {
+      const dayKey = new Date(meal.timestamp).toDateString();
+      mealDays.add(dayKey);
+      mealTypeCounts[meal.mealType].add(dayKey);
+    }
+
+    const requiredMealTypes = [MealType.BREAKFAST, MealType.LUNCH, MealType.DINNER];
+    for (const day of mealDays) {
+      const hasAllRequired = requiredMealTypes.every(type => mealTypeCounts[type].has(day));
+      if (hasAllRequired) {
+        completeMealDays.add(day);
+      }
+    }
+
+    let currentStreak = 0;
+    let maxStreak = 0;
+    const today = new Date().toDateString();
+    
+    for (let i = 0; i < days; i++) {
+      const checkDate = new Date(endDate - i * 24 * 60 * 60 * 1000).toDateString();
+      if (mealDays.has(checkDate)) {
+        currentStreak++;
+        maxStreak = Math.max(maxStreak, currentStreak);
+      } else if (checkDate !== today) {
+        break;
+      }
+    }
+
+    const checkInDays = mealDays.size;
+    const completeDays = completeMealDays.size;
+    const checkInRate = safeDivide(checkInDays, days, 0);
+    const completionRate = safeDivide(completeDays, days, 0);
+
+    const hasData = checkInDays > 0;
+    const score = hasData
+      ? Math.min(100, roundTo(checkInRate * 60 + completionRate * 40, 1))
+      : null;
+
+    return {
+      checkInDays,
+      completeDays,
+      totalDays: days,
+      checkInRate: roundTo(checkInRate * 100, 1),
+      completionRate: roundTo(completionRate * 100, 1),
+      currentStreak,
+      maxStreak,
+      mealTypeBreakdown: {
+        breakfast: mealTypeCounts[MealType.BREAKFAST].size,
+        lunch: mealTypeCounts[MealType.LUNCH].size,
+        dinner: mealTypeCounts[MealType.DINNER].size,
+        snack: mealTypeCounts[MealType.SNACK].size,
+      },
+      score,
+    };
+  }
+
+  private analyzeCalories(meals: MealRecord[], goals: UserGoals, days: number) {
+    const dailyCalories: Record<string, number> = {};
+    
+    for (const meal of meals) {
+      const dayKey = new Date(meal.timestamp).toDateString();
+      dailyCalories[dayKey] = (dailyCalories[dayKey] || 0) + (meal.totalNutrition.calories || 0);
+    }
+
+    const recordedDays = Object.keys(dailyCalories).length;
+    const totalCalories = Object.values(dailyCalories).reduce((a, b) => a + b, 0);
+    const avgDailyCalories = safeDivide(totalCalories, recordedDays, 0);
+    const targetCalories = goals.dailyCalories || 2000;
+    
+    const deviation = targetCalories > 0 ? (avgDailyCalories - targetCalories) / targetCalories : 0;
+    const deviationPercent = roundTo(deviation * 100, 1);
+
+    const achievedDays = Object.values(dailyCalories).filter(c => {
+      const ratio = safeDivide(c, targetCalories, 0);
+      return ratio >= 0.8 && ratio <= 1.2;
+    }).length;
+
+    const achievedRate = safeDivide(achievedDays, recordedDays, 0);
+
+    const hasData = recordedDays > 0;
+    let score: number | null = null;
+    
+    if (hasData) {
+      const deviationScore = Math.max(0, 100 - Math.abs(deviationPercent) * 2);
+      const consistencyScore = achievedRate * 100;
+      score = Math.min(100, roundTo(deviationScore * 0.6 + consistencyScore * 0.4, 1));
+    }
+
+    return {
+      averageDailyCalories: roundTo(avgDailyCalories, 1),
+      targetCalories,
+      deviationPercent,
+      deviationDirection: (deviation > 0 ? 'over' : deviation < 0 ? 'under' : 'on_target') as 'over' | 'under' | 'on_target',
+      recordedDays,
+      achievedDays,
+      achievedRate: roundTo(achievedRate * 100, 1),
+      totalCalories: roundTo(totalCalories, 1),
+      score,
+    };
+  }
+
+  private analyzeWater(waters: WaterRecord[], goals: UserGoals, days: number) {
+    const dailyWater: Record<string, number> = {};
+    
+    for (const water of waters) {
+      const dayKey = new Date(water.timestamp).toDateString();
+      dailyWater[dayKey] = (dailyWater[dayKey] || 0) + water.amount;
+    }
+
+    const recordedDays = Object.keys(dailyWater).length;
+    const totalWater = Object.values(dailyWater).reduce((a, b) => a + b, 0);
+    const avgDailyWater = safeDivide(totalWater, recordedDays, 0);
+    const targetWater = goals.dailyWater || 2000;
+
+    const achievedDays = Object.values(dailyWater).filter(w => w >= targetWater).length;
+    const achievedRate = safeDivide(achievedDays, recordedDays, 0);
+    const avgAchievementRate = safeDivide(avgDailyWater, targetWater, 0);
+
+    const hasData = recordedDays > 0;
+    let score: number | null = null;
+    
+    if (hasData) {
+      const achievementScore = Math.min(100, avgAchievementRate * 100);
+      const consistencyScore = achievedRate * 100;
+      score = Math.min(100, roundTo(achievementScore * 0.5 + consistencyScore * 0.5, 1));
+    }
+
+    return {
+      averageDailyWaterMl: roundTo(avgDailyWater, 1),
+      targetWaterMl: targetWater,
+      recordedDays,
+      achievedDays,
+      achievedRate: roundTo(achievedRate * 100, 1),
+      averageAchievementRate: roundTo(avgAchievementRate * 100, 1),
+      totalWaterMl: roundTo(totalWater, 1),
+      score,
+    };
+  }
+
+  private analyzeWeightTrend(
+    weights: WeightRecord[],
+    profile: UserProfile,
+    goals: UserGoals,
+    startDate: number,
+    endDate: number
+  ) {
+    if (weights.length === 0) {
+      const goalDir = (goals.dietGoal === DietGoal.LOSE_WEIGHT ? 'down' : 
+                      goals.dietGoal === DietGoal.GAIN_WEIGHT || goals.dietGoal === DietGoal.BUILD_MUSCLE ? 'up' : 'stable') as 'up' | 'down' | 'stable';
+      return {
+        startWeight: null,
+        endWeight: null,
+        weightChange: null,
+        changePercent: null,
+        direction: 'stable' as const,
+        goalDirection: goalDir,
+        isOnTrack: false,
+        recordedDays: 0,
+        weeklyRate: null,
+        desensitizedInfo: createDesensitizedWeightInfo(0, 70, 70, 14, goalDir),
+        score: null,
+      };
+    }
+
+    const sortedWeights = [...weights].sort((a, b) => a.timestamp - b.timestamp);
+    const startWeight = sortedWeights[0].weight;
+    const endWeight = sortedWeights[sortedWeights.length - 1].weight;
+    const weightChange = endWeight - startWeight;
+    const changePercent = startWeight > 0 ? (weightChange / startWeight) * 100 : 0;
+    
+    const daysDiff = Math.max(1, Math.ceil((endDate - startDate) / (24 * 60 * 60 * 1000)));
+    const weeklyRate = (weightChange / daysDiff) * 7;
+
+    const goalDirection = (goals.dietGoal === DietGoal.LOSE_WEIGHT ? 'down' : 
+                         goals.dietGoal === DietGoal.GAIN_WEIGHT || goals.dietGoal === DietGoal.BUILD_MUSCLE ? 'up' : 'stable') as 'up' | 'down' | 'stable';
+    const goalRate = goals.weeklyWeightChange || 0;
+    
+    let isOnTrack = false;
+    if (goalDirection === 'stable') {
+      isOnTrack = Math.abs(changePercent) < 2;
+    } else if (goalDirection === 'down') {
+      isOnTrack = weightChange < 0 || (goalRate < 0 && weeklyRate >= goalRate && weeklyRate <= 0);
+    } else if (goalDirection === 'up') {
+      isOnTrack = weightChange > 0 || (goalRate > 0 && weeklyRate <= goalRate && weeklyRate >= 0);
+    }
+
+    const recordedDays = new Set(weights.map(w => new Date(w.timestamp).toDateString())).size;
+    
+    let score: number | null = null;
+    if (recordedDays >= 3) {
+      const progressScore = isOnTrack ? 100 : Math.max(0, 100 - Math.abs(changePercent) * 5);
+      const consistencyScore = Math.min(100, (recordedDays / 14) * 100);
+      score = Math.min(100, roundTo(progressScore * 0.7 + consistencyScore * 0.3, 1));
+    }
+
+    let direction: 'up' | 'down' | 'stable' = 'stable';
+    if (Math.abs(changePercent) >= 1) {
+      direction = changePercent > 0 ? 'up' : 'down';
+    }
+
+    const desensitizedInfo = createDesensitizedWeightInfo(
+      weightChange,
+      startWeight,
+      endWeight,
+      daysDiff,
+      goalDirection
+    );
+
+    return {
+      startWeight: roundTo(startWeight, 2),
+      endWeight: roundTo(endWeight, 2),
+      weightChange: roundTo(weightChange, 2),
+      changePercent: roundTo(changePercent, 1),
+      direction,
+      goalDirection,
+      isOnTrack,
+      recordedDays,
+      weeklyRate: roundTo(weeklyRate, 2),
+      desensitizedInfo,
+      score,
+    };
+  }
+
+  private generateExecutionInsights(
+    checkIn: any,
+    calorie: any,
+    water: any,
+    weight: any,
+    hasEnoughData: boolean
+  ): ExecutionInsight[] {
+    const insights: ExecutionInsight[] = [];
+
+    if (!hasEnoughData) {
+      insights.push({
+        type: 'info',
+        category: 'general',
+        priority: 1,
+        title: '开始记录您的健康数据',
+        message: '还没有足够的数据生成分析建议。开始记录饮食、饮水和体重吧！',
+        action: 'add_record',
+        metric: null,
+        target: null,
+        current: null,
+      });
+      return insights;
+    }
+
+    if (checkIn.currentStreak >= 7) {
+      insights.push({
+        type: 'success',
+        category: 'check_in',
+        priority: 1,
+        title: '🎉 太棒了！连续打卡' + checkIn.currentStreak + '天',
+        message: `您已经连续${checkIn.currentStreak}天记录饮食，继续保持！`,
+        action: 'keep_going',
+        metric: 'streak',
+        current: checkIn.currentStreak,
+        target: null,
+      });
+    } else if (checkIn.currentStreak >= 3) {
+      insights.push({
+        type: 'info',
+        category: 'check_in',
+        priority: 2,
+        title: `💪 连续打卡${checkIn.currentStreak}天`,
+        message: `再坚持${7 - checkIn.currentStreak}天就能达成周打卡目标！`,
+        action: 'maintain_streak',
+        metric: 'streak',
+        current: checkIn.currentStreak,
+        target: 7,
+      });
+    }
+
+    if (calorie.deviationDirection === 'over' && Math.abs(calorie.deviationPercent) > 10) {
+      insights.push({
+        type: 'warning',
+        category: 'calorie',
+        priority: 2,
+        title: '🍽️ 热量摄入偏高',
+        message: `平均每日热量${calorie.averageDailyCalories}千卡，超出目标${Math.abs(calorie.deviationPercent)}%`,
+        action: 'reduce_calorie',
+        metric: 'calorie',
+        current: calorie.averageDailyCalories,
+        target: calorie.targetCalories,
+      });
+    } else if (calorie.deviationDirection === 'under' && Math.abs(calorie.deviationPercent) > 10) {
+      insights.push({
+        type: 'warning',
+        category: 'calorie',
+        priority: 2,
+        title: '🍽️ 热量摄入偏低',
+        message: `平均每日热量${calorie.averageDailyCalories}千卡，低于目标${Math.abs(calorie.deviationPercent)}%`,
+        action: 'increase_calorie',
+        metric: 'calorie',
+        current: calorie.averageDailyCalories,
+        target: calorie.targetCalories,
+      });
+    } else if (calorie.deviationDirection === 'on_target' || Math.abs(calorie.deviationPercent) <= 10) {
+      insights.push({
+        type: 'success',
+        category: 'calorie',
+        priority: 1,
+        title: '✅ 热量控制良好',
+        message: `平均每日热量${calorie.averageDailyCalories}千卡，与目标基本一致`,
+        action: 'keep_going',
+        metric: 'calorie',
+        current: calorie.averageDailyCalories,
+        target: calorie.targetCalories,
+      });
+    }
+
+    if (water.achievedRate >= 80) {
+      insights.push({
+        type: 'success',
+        category: 'water',
+        priority: 1,
+        title: '💧 饮水达标很棒',
+        message: `饮水达标率${water.achievedRate}%，继续保持充足饮水！`,
+        action: 'keep_going',
+        metric: 'water',
+        current: water.averageDailyWaterMl,
+        target: water.targetWaterMl,
+      });
+    } else if (water.achievedRate >= 50) {
+      insights.push({
+        type: 'info',
+        category: 'water',
+        priority: 2,
+        title: '💧 还需多喝水',
+        message: `饮水达标率${water.achievedRate}%，建议每天喝够${water.targetWaterMl}毫升`,
+        action: 'drink_more',
+        metric: 'water',
+        current: water.averageDailyWaterMl,
+        target: water.targetWaterMl,
+      });
+    } else if (water.recordedDays > 0) {
+      insights.push({
+        type: 'warning',
+        category: 'water',
+        priority: 2,
+        title: '⚠️ 饮水明显不足',
+        message: `平均每日只喝了${water.averageDailyWaterMl}毫升，记得定时补充水分`,
+        action: 'set_reminder',
+        metric: 'water',
+        current: water.averageDailyWaterMl,
+        target: water.targetWaterMl,
+      });
+    }
+
+    if (weight.recordedDays >= 3) {
+      if (weight.isOnTrack) {
+        insights.push({
+          type: 'success',
+          category: 'weight',
+          priority: 1,
+          title: weight.desensitizedInfo.description,
+          message: `体重趋势${weight.direction === 'down' ? '下降' : weight.direction === 'up' ? '上升' : '稳定'}，与目标方向一致`,
+          action: 'keep_going',
+          metric: 'weight',
+          current: null,
+          target: null,
+        });
+      } else {
+        insights.push({
+          type: 'warning',
+          category: 'weight',
+          priority: 2,
+          title: weight.desensitizedInfo.description,
+          message: `体重变化方向与目标略有偏差，建议调整饮食和运动`,
+          action: 'adjust_plan',
+          metric: 'weight',
+          current: null,
+          target: null,
+        });
+      }
+    }
+
+    return insights.sort((a, b) => a.priority - b.priority);
+  }
+
+  private generateExecutionSummary(
+    checkIn: any,
+    calorie: any,
+    water: any,
+    weight: any,
+    hasEnoughData: boolean,
+    overallScore: number
+  ): string {
+    if (!hasEnoughData) {
+      return '开始记录饮食、饮水和体重，我们将为您生成个性化的健康执行分析。';
+    }
+
+    const parts: string[] = [];
+    
+    parts.push(`本次分析覆盖${checkIn.totalDays}天，共记录${checkIn.checkInDays}天饮食。`);
+    
+    if (checkIn.currentStreak >= 3) {
+      parts.push(`连续打卡${checkIn.currentStreak}天，`);
+    }
+    
+    parts.push(`热量平均每日${calorie.averageDailyCalories}千卡，`);
+    if (calorie.deviationDirection === 'on_target') {
+      parts.push('控制良好。');
+    } else if (calorie.deviationDirection === 'over') {
+      parts.push(`偏高${Math.abs(calorie.deviationPercent)}%。`);
+    } else {
+      parts.push(`偏低${Math.abs(calorie.deviationPercent)}%。`);
+    }
+
+    if (water.recordedDays > 0) {
+      parts.push(`饮水达标率${water.achievedRate}%。`);
+    }
+
+    if (weight.recordedDays >= 3) {
+      parts.push(weight.desensitizedInfo.description);
+    }
+
+    parts.push(`综合健康执行分：${overallScore}分。`);
+
+    return parts.join('');
+  }
+
+  private generatePersonalizedRecommendations(
+    checkIn: any,
+    calorie: any,
+    water: any,
+    weight: any,
+    hasEnoughData: boolean
+  ): string[] {
+    if (!hasEnoughData) {
+      return [
+        '每天记录三餐饮食，帮助了解自己的饮食习惯',
+        '设置定时提醒，别忘了喝水和记录体重',
+        '坚持记录2周以上，就能获得更准确的趋势分析',
+      ];
+    }
+
+    const recommendations: string[] = [];
+
+    if (checkIn.checkInRate < 70) {
+      recommendations.push('建议每天至少记录早餐、午餐、晚餐三餐，提高打卡率');
+    }
+
+    if (checkIn.currentStreak >= 3 && checkIn.currentStreak < 7) {
+      recommendations.push(`再坚持${7 - checkIn.currentStreak}天就能达成连续7天打卡，加油！`);
+    }
+
+    if (calorie.deviationDirection === 'over' && Math.abs(calorie.deviationPercent) > 15) {
+      recommendations.push('建议适当减少高热量食物，增加蔬菜和蛋白质的摄入比例');
+    }
+
+    if (calorie.deviationDirection === 'under' && Math.abs(calorie.deviationPercent) > 15) {
+      recommendations.push('热量摄入偏低，建议适当增加主食或优质脂肪的摄入');
+    }
+
+    if (water.averageAchievementRate < 70) {
+      recommendations.push(`建议每天分6-8次喝水，每次200-300ml，达到${water.targetWaterMl}ml目标`);
+    }
+
+    if (weight.recordedDays < 3) {
+      recommendations.push('建议每周固定时间记录2-3次体重，便于追踪趋势变化');
+    } else if (!weight.isOnTrack) {
+      recommendations.push('体重变化与目标有偏差，建议结合运动和饮食进行综合调整');
+    }
+
+    if (recommendations.length === 0) {
+      recommendations.push('继续保持当前的健康生活方式！');
+      recommendations.push('可以尝试增加一些力量训练，提升肌肉量');
+      recommendations.push('关注食物的多样性，确保营养均衡');
+    }
+
+    return recommendations.slice(0, 5);
   }
 }

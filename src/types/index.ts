@@ -119,7 +119,7 @@ export interface FoodConversionInfo {
   servingInfo?: ServingInfo;
   cupInfo?: CupInfo;
   cookingConversion?: CookingConversion;
-  ediblePortion: number;
+  ediblePortion?: number;
 }
 
 export interface FoodItem {
@@ -397,6 +397,7 @@ export interface SDKConfig {
   timezone?: string;
   locale?: string;
   desensitize?: DesensitizeOptions;
+  dataQuality?: Partial<DataQualityConfig>;
 }
 
 export interface StorageAdapter {
@@ -404,4 +405,196 @@ export interface StorageAdapter {
   set: <T>(key: string, value: T) => Promise<void>;
   remove: (key: string) => Promise<void>;
   list: <T>(prefix: string) => Promise<T[]>;
+}
+
+export type ValidationSeverity = 'error' | 'warning' | 'info';
+
+export type ValidationErrorCode = 
+  | 'INVALID_UNIT'
+  | 'INVALID_QUANTITY'
+  | 'INVALID_TIMESTAMP'
+  | 'INVALID_NUTRITION_VALUE'
+  | 'QUANTITY_TOO_LOW'
+  | 'QUANTITY_TOO_HIGH'
+  | 'TIMESTAMP_IN_FUTURE'
+  | 'TIMESTAMP_TOO_OLD'
+  | 'NUTRITION_IMBALANCED'
+  | 'UNIT_MISMATCH'
+  | 'FOOD_NOT_FOUND'
+  | 'DUPLICATE_RECORD';
+
+export interface ValidationError {
+  code: ValidationErrorCode;
+  severity: ValidationSeverity;
+  field: string;
+  message: string;
+  suggestion: string;
+  currentValue: any;
+  expectedRange?: { min?: number; max?: number };
+  suggestedValue?: any;
+}
+
+export interface ValidationResult<T = any> {
+  isValid: boolean;
+  errors: ValidationError[];
+  warnings: ValidationError[];
+  data?: T;
+  correctedData?: T;
+}
+
+export interface BatchOperationResult<T = any, TInput = any> {
+  successCount: number;
+  failureCount: number;
+  totalCount: number;
+  successful: Array<{ index: number; data: T; id?: string }>;
+  failed: Array<{ index: number; data: TInput; errors: ValidationError[] }>;
+  warnings: Array<{ index: number; data: T; warnings: ValidationError[] }>;
+  results: Array<{
+    index: number;
+    valid: boolean;
+    data?: T;
+    input: TInput;
+    errors: ValidationError[];
+    warnings: ValidationError[];
+  }>;
+}
+
+export type ConflictResolutionStrategy = 
+  | 'last_write_wins'
+  | 'first_write_wins'
+  | 'merge_by_timestamp'
+  | 'manual'
+  | 'keep_higher_quantity'
+  | 'keep_more_recent_nutrition';
+
+export interface ConflictInfo {
+  key: string;
+  existingValue: any;
+  incomingValue: any;
+  existingTimestamp: number;
+  incomingTimestamp: number;
+  resolution: ConflictResolutionStrategy;
+  mergedValue?: any;
+}
+
+export interface SyncMergeResult {
+  mergedKeys: string[];
+  conflictCount: number;
+  conflicts: ConflictInfo[];
+  importedCount: number;
+  skippedCount: number;
+  rollbackToken: string;
+}
+
+export interface RollbackResult {
+  success: boolean;
+  rollbackToken: string;
+  restoredCount: number;
+  restoredKeys: string[];
+  error?: string;
+}
+
+export interface IncrementalExportOptions {
+  sinceTimestamp?: number;
+  userId?: string;
+  recordTypes?: Array<'meal' | 'water' | 'weight' | 'profile' | 'favorite' | 'combination'>;
+  includeDeleted?: boolean;
+}
+
+export interface ExecutionInsight {
+  type: 'success' | 'warning' | 'info' | 'error';
+  category: 'check_in' | 'calorie' | 'water' | 'weight' | 'general';
+  priority: number;
+  title: string;
+  message: string;
+  action: string;
+  metric: string | null;
+  current: number | null;
+  target: number | null;
+}
+
+export interface GoalExecutionAnalysis {
+  period: { start: number; end: number; days: number };
+  overallScore: number;
+  insights: ExecutionInsight[];
+  checkInAnalysis: {
+    totalDays: number;
+    checkInDays: number;
+    completeDays: number;
+    checkInRate: number;
+    completionRate: number;
+    currentStreak: number;
+    maxStreak: number;
+    mealTypeBreakdown: {
+      breakfast: number;
+      lunch: number;
+      dinner: number;
+      snack: number;
+    };
+    score: number;
+  };
+  calorieAnalysis: {
+    averageDailyCalories: number;
+    targetCalories: number;
+    deviationPercent: number;
+    deviationDirection: 'over' | 'under' | 'on_target';
+    recordedDays: number;
+    achievedDays: number;
+    achievedRate: number;
+    totalCalories: number;
+    score: number;
+  };
+  waterAnalysis: {
+    averageDailyWaterMl: number;
+    targetWaterMl: number;
+    recordedDays: number;
+    achievedDays: number;
+    achievedRate: number;
+    averageAchievementRate: number;
+    totalWaterMl: number;
+    score: number;
+  };
+  weightAnalysis: {
+    startWeight: number | null;
+    endWeight: number | null;
+    weightChange: number | null;
+    changePercent: number | null;
+    direction: 'up' | 'down' | 'stable';
+    goalDirection: 'up' | 'down' | 'stable';
+    isOnTrack: boolean;
+    recordedDays: number;
+    weeklyRate: number | null;
+    desensitizedInfo: DesensitizedWeightInfo;
+    score: number;
+  };
+  summary: string;
+  personalizedRecommendations: string[];
+}
+
+export type WeightTrendDescription = 
+  | 'maintaining_stable'
+  | 'slowly_losing'
+  | 'moderate_loss'
+  | 'significant_loss'
+  | 'slowly_gaining'
+  | 'moderate_gain'
+  | 'significant_gain'
+  | 'insufficient_data';
+
+export interface DesensitizedWeightInfo {
+  trend: WeightTrendDescription;
+  direction: 'up' | 'down' | 'stable';
+  description: string;
+  changeCategory: 'small' | 'moderate' | 'significant';
+}
+
+export interface DataQualityConfig {
+  enableValidation: boolean;
+  rejectOnError: boolean;
+  autoCorrectWarnings: boolean;
+  maxFutureDays: number;
+  maxPastDays: number;
+  minQuantity: number;
+  maxQuantity: number;
+  nutritionRanges: Partial<Record<keyof NutritionFacts, { min: number; max: number; per100g: boolean }>>;
 }
