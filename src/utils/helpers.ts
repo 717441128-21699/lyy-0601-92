@@ -534,22 +534,23 @@ export const desensitizeReport = (
     
     result.desensitizedWeightInfo = desensitizedWeight;
     
-    if (result.weightTrend) {
+    const weightChangeObj = {
+      description: desensitizedWeight.description,
+      direction: desensitizedWeight.direction,
+      changeCategory: desensitizedWeight.changeCategory,
+    };
+    
+    if (result.weightTrend !== undefined) {
       result.weightTrend = {
         description: desensitizedWeight.description,
         direction: desensitizedWeight.direction,
         trend: desensitizedWeight.trend,
         changeCategory: desensitizedWeight.changeCategory,
       };
-      delete result.weightChange;
     }
     
     if (result.weightChange !== undefined) {
-      result.weightChange = {
-        description: desensitizedWeight.description,
-        direction: desensitizedWeight.direction,
-        changeCategory: desensitizedWeight.changeCategory,
-      };
+      result.weightChange = weightChangeObj;
     }
     
     if (result.weeklyComparison) {
@@ -610,12 +611,28 @@ export const desensitizeReport = (
         desensitizedInfo: desensitizedWeight,
       };
     }
+    
+    if (result.healthScore) {
+      result.healthScore = {
+        ...result.healthScore,
+        weight: desensitizedWeight.direction === 'stable' ? 0 : null,
+      };
+    }
+    
+    if (result.avgWeight) {
+      result.avgWeight = {
+        description: `平均体重${desensitizedWeight.direction === 'up' ? '略有上升' : desensitizedWeight.direction === 'down' ? '略有下降' : '基本稳定'}`,
+        direction: desensitizedWeight.direction,
+      };
+    }
   }
   
   return result;
 };
 
 export const desensitizeWeeklyReport = desensitizeReport;
+export const desensitizeMonthlyReport = desensitizeReport;
+export const desensitizeTrendAnalysis = desensitizeReport;
 
 export const roundTo = (value: number, decimals: number = 2): number => {
   const factor = Math.pow(10, decimals);

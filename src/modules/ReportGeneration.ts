@@ -923,61 +923,93 @@ export class ReportGenerationManager {
     const currentCompleteDays = currentDailyDetails.filter(d => d.status === 'complete').length;
     const previousCompleteDays = previousDailyDetails.filter(d => d.status === 'complete').length;
     
-    let nutritionScore = 60;
+    const hasMealData = currentMeals.length > 0;
+    const hasWeightData = currentWeights.length > 0;
+    const hasWaterData = currentWater.length > 0;
+    const hasAnyData = hasMealData || hasWeightData || hasWaterData;
+    
+    let nutritionScore = 0;
     const caloriePercent = goals.dailyCalories > 0 ? (currentAvgCalories / goals.dailyCalories) * 100 : 100;
     
-    if (caloriesComparison.direction === 'stable') {
-      if (caloriePercent >= 90 && caloriePercent <= 110) {
-        nutritionScore = 90;
-      } else {
-        nutritionScore = 75;
+    if (hasMealData) {
+      nutritionScore = 60;
+      if (caloriesComparison.direction === 'stable') {
+        if (caloriePercent >= 90 && caloriePercent <= 110) {
+          nutritionScore = 90;
+        } else {
+          nutritionScore = 75;
+        }
+      } else if (
+        (caloriesComparison.direction === 'down' && currentAvgCalories > goals.dailyCalories) ||
+        (caloriesComparison.direction === 'up' && currentAvgCalories < goals.dailyCalories)
+      ) {
+        nutritionScore = 85;
       }
-    } else if (
-      (caloriesComparison.direction === 'down' && currentAvgCalories > goals.dailyCalories) ||
-      (caloriesComparison.direction === 'up' && currentAvgCalories < goals.dailyCalories)
-    ) {
-      nutritionScore = 85;
+      nutritionScore = Math.min(100, Math.max(0, nutritionScore));
     }
-    nutritionScore = Math.min(100, Math.max(0, nutritionScore));
     
     let waterGoalMl = goals.dailyWater;
     if (goals.waterUnit === UnitType.LITER) waterGoalMl *= 1000;
-    const waterScore = waterGoalMl > 0 ? Math.min(100, Math.max(0, roundTo((currentAvgWaterMl / waterGoalMl) * 100, 0))) : 70;
+    const waterScore = hasWaterData && waterGoalMl > 0 
+      ? Math.min(100, Math.max(0, roundTo((currentAvgWaterMl / waterGoalMl) * 100, 0))) 
+      : 0;
     
-    const weightScore = weightComparison.direction === 'stable' ? 85 :
-      (weightComparison.direction === 'down' && goals.dietGoal === DietGoal.LOSE_WEIGHT) ? 90 :
-      (weightComparison.direction === 'up' && (goals.dietGoal === DietGoal.GAIN_WEIGHT || goals.dietGoal === DietGoal.BUILD_MUSCLE)) ? 90 : 70;
+    let weightScore = 0;
+    if (hasWeightData) {
+      weightScore = weightComparison.direction === 'stable' ? 85 :
+        (weightComparison.direction === 'down' && goals.dietGoal === DietGoal.LOSE_WEIGHT) ? 90 :
+        (weightComparison.direction === 'up' && (goals.dietGoal === DietGoal.GAIN_WEIGHT || goals.dietGoal === DietGoal.BUILD_MUSCLE)) ? 90 : 70;
+    }
     
-    const consistencyScore = Math.min(100, Math.max(0,
+    const consistencyScore = hasMealData ? Math.min(100, Math.max(0,
       (currentCheckIn.checkInDays / daysToCompare) * 100
-    ));
+    )) : 0;
     
-    const totalScore = roundTo((nutritionScore + waterScore + weightScore + consistencyScore) / 4, 1);
+    const scoreComponents = [nutritionScore, waterScore, weightScore, consistencyScore];
+    const validScores = scoreComponents.filter(s => s > 0);
+    const totalScore = hasAnyData && validScores.length > 0
+      ? roundTo(validScores.reduce((a, b) => a + b, 0) / validScores.length, 1)
+      : 0;
     
     const insights: string[] = [];
     
-    if (nutritionScore >= 80) {
-      insights.push('营养摄入控制良好，继续保持');
+    if (!hasAnyData) {
+      insights.push('还没有记录任何数据，从今天开始记录饮食、饮水和体重吧');
+      insights.push('坚持打卡7天就能看到完整的趋势分析哦');
     } else {
-      insights.push('需要更加注意营养均衡和热量控制');
-    }
-    
-    if (waterScore >= 80) {
-      insights.push('饮水量充足，继续保持');
-    } else {
-      insights.push('饮水量不足，建议每天至少喝够8杯水');
-    }
-    
-    if (consistencyScore >= 80) {
-      insights.push('打卡坚持度很高，非常棒');
-    } else {
-      insights.push('打卡频率可以再提升一些，坚持就是胜利');
-    }
-    
-    if (currentCompleteDays > previousCompleteDays) {
-      insights.push(`完整打卡天数比上周增加${currentCompleteDays - previousCompleteDays}天，进步明显`);
-    } else if (currentCompleteDays < previousCompleteDays) {
-      insights.push(`完整打卡天数比上周减少${previousCompleteDays - currentCompleteDays}天，需要加油`);
+      if (hasMealData) {
+        if (nutritionScore >= 80) {
+          insights.push('营养摄入控制良好，继续保持');
+        } else {
+          insights.push('需要更加注意营养均衡和热量控制');
+        }
+      } else {
+        insights.push('还没有记录饮食，建议从记录每一餐开始');
+      }
+      
+      if (hasWaterData) {
+        if (waterScore >= 80) {
+          insights.push('饮水量充足，继续保持');
+        } else {
+          insights.push('饮水量不足，建议每天至少喝够8杯水');
+        }
+      } else {
+        insights.push('还没有记录饮水，记得每天按时喝水');
+      }
+      
+      if (hasMealData) {
+        if (consistencyScore >= 80) {
+          insights.push('打卡坚持度很高，非常棒');
+        } else {
+          insights.push('打卡频率可以再提升一些，坚持就是胜利');
+        }
+        
+        if (currentCompleteDays > previousCompleteDays) {
+          insights.push(`完整打卡天数比上周增加${currentCompleteDays - previousCompleteDays}天，进步明显`);
+        } else if (currentCompleteDays < previousCompleteDays) {
+          insights.push(`完整打卡天数比上周减少${previousCompleteDays - currentCompleteDays}天，需要加油`);
+        }
+      }
     }
     
     return {
@@ -1050,9 +1082,9 @@ export class ReportGenerationManager {
       calorieAnalysis.score,
       waterAnalysis.score,
       weightAnalysis.score,
-    ].filter(s => s !== null) as number[];
+    ];
 
-    const overallScore = hasEnoughData && scoreComponents.length > 0
+    const overallScore = hasEnoughData && scoreComponents.some(s => s > 0)
       ? roundTo(scoreComponents.reduce((a, b) => a + b, 0) / scoreComponents.length, 1)
       : 0;
 
@@ -1157,7 +1189,7 @@ export class ReportGenerationManager {
     const hasData = checkInDays > 0;
     const score = hasData
       ? Math.min(100, roundTo(checkInRate * 60 + completionRate * 40, 1))
-      : null;
+      : 0;
 
     return {
       checkInDays,
@@ -1201,7 +1233,7 @@ export class ReportGenerationManager {
     const achievedRate = safeDivide(achievedDays, recordedDays, 0);
 
     const hasData = recordedDays > 0;
-    let score: number | null = null;
+    let score: number = 0;
     
     if (hasData) {
       const deviationScore = Math.max(0, 100 - Math.abs(deviationPercent) * 2);
@@ -1227,7 +1259,7 @@ export class ReportGenerationManager {
     
     for (const water of waters) {
       const dayKey = new Date(water.timestamp).toDateString();
-      dailyWater[dayKey] = (dailyWater[dayKey] || 0) + water.amount;
+      dailyWater[dayKey] = (dailyWater[dayKey] || 0) + water.normalizedAmountMl;
     }
 
     const recordedDays = Object.keys(dailyWater).length;
@@ -1240,7 +1272,7 @@ export class ReportGenerationManager {
     const avgAchievementRate = safeDivide(avgDailyWater, targetWater, 0);
 
     const hasData = recordedDays > 0;
-    let score: number | null = null;
+    let score: number = 0;
     
     if (hasData) {
       const achievementScore = Math.min(100, avgAchievementRate * 100);
@@ -1281,7 +1313,7 @@ export class ReportGenerationManager {
         recordedDays: 0,
         weeklyRate: null,
         desensitizedInfo: createDesensitizedWeightInfo(0, 70, 70, 14, goalDir),
-        score: null,
+        score: 0,
       };
     }
 
@@ -1309,7 +1341,7 @@ export class ReportGenerationManager {
 
     const recordedDays = new Set(weights.map(w => new Date(w.timestamp).toDateString())).size;
     
-    let score: number | null = null;
+    let score: number = 0;
     if (recordedDays >= 3) {
       const progressScore = isOnTrack ? 100 : Math.max(0, 100 - Math.abs(changePercent) * 5);
       const consistencyScore = Math.min(100, (recordedDays / 14) * 100);

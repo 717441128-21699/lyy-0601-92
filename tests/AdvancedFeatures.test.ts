@@ -645,16 +645,20 @@ describe('Advanced Features Tests', () => {
         maskWeight: true,
       });
 
-      for (const weight of desensitizedReport.weightTrend) {
-        const decimalPart = weight.toString().split('.')[1];
-        expect(decimalPart?.length || 0).toBeLessThanOrEqual(1);
-      }
+      expect(desensitizedReport.weightTrend).toBeDefined();
+      expect(typeof desensitizedReport.weightTrend).toBe('object');
+      expect(desensitizedReport.weightTrend.direction).toBeDefined();
+      expect(desensitizedReport.weightTrend.description).toBeDefined();
+      expect(desensitizedReport.weightTrend.description).not.toMatch(/[\d.]+/);
 
-      const changeDecimal = desensitizedReport.weightChange.toString().split('.')[1];
-      expect(changeDecimal?.length || 0).toBeLessThanOrEqual(1);
+      expect(desensitizedReport.weightChange).toBeDefined();
+      expect(typeof desensitizedReport.weightChange).toBe('object');
+      expect(desensitizedReport.weightChange.direction).toBeDefined();
+      expect(desensitizedReport.weightChange.description).toBeDefined();
+      expect(desensitizedReport.weightChange.description).not.toMatch(/[\d.]+/);
 
       for (const fluctuation of desensitizedReport.abnormalFluctuations) {
-        expect(fluctuation.description).toContain('XXkg');
+        expect(fluctuation.description).not.toMatch(/[\d.]+\s*(kg|千克|公斤|斤|磅|lb)/);
       }
     });
   });
@@ -734,7 +738,11 @@ describe('Advanced Features Tests', () => {
       const desensitizedJson = await sdk2.exportDesensitizedReport(report!, 'json');
       const parsed = JSON.parse(desensitizedJson);
       expect(parsed.userId).not.toBe(testUserId);
-      expect(parsed.weightChange.toString().split('.')[1]?.length || 0).toBeLessThanOrEqual(1);
+      expect(parsed.weightChange).toBeDefined();
+      expect(typeof parsed.weightChange).toBe('object');
+      expect(parsed.weightChange.direction).toBeDefined();
+      expect(parsed.weightChange.description).toBeDefined();
+      expect(parsed.weightChange.description).not.toMatch(/[\d.]+/);
 
       const dailyDetails = parsed.dailyCheckInDetails;
       const todayDetail = dailyDetails.find((d: any) =>
@@ -1603,15 +1611,19 @@ describe('Advanced Features Tests', () => {
 
       expect(desensitizedText).not.toContain('70.5');
       expect(desensitizedText).not.toContain('69.8');
-      expect(desensitizedText).not.toMatch(/[\d.]+kg/);
+      expect(desensitizedText).not.toMatch(/[\d.]+\s*(kg|千克|公斤|斤|磅|lb)/);
       expect(desensitizedText).not.toMatch(/体重增加[\d.]+/);
       expect(desensitizedText).not.toMatch(/体重减少[\d.]+/);
-      expect(desensitizedText).toContain('XXkg');
+      expect(desensitizedText).toMatch(/体重(呈|基本|略有|呈明显|呈中度)/);
 
       const desensitizedJson = await sdk.exportDesensitizedReport(weeklyReport!, 'json');
       const parsed = JSON.parse(desensitizedJson);
       
-      expect(parsed.weightChange.toString()).not.toMatch(/^[0-9]+\.[0-9]{2,}$/);
+      expect(parsed.weightChange).toBeDefined();
+      expect(typeof parsed.weightChange).toBe('object');
+      expect(parsed.weightChange.direction).toBeDefined();
+      expect(parsed.weightChange.description).toBeDefined();
+      expect(parsed.weightChange.description).not.toMatch(/[\d.]+/);
       expect(parsed.weightTrend?.startWeight).not.toBeDefined();
       expect(parsed.weightTrend?.endWeight).not.toBeDefined();
     });

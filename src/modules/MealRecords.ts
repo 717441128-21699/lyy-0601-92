@@ -35,6 +35,7 @@ import {
   validateMealFoodEntry,
   validateWaterRecord,
   validateWeightRecord,
+  validateTimestamp,
   createBatchResult,
   DEFAULT_DATA_QUALITY_CONFIG,
 } from '../utils/helpers';
@@ -67,8 +68,36 @@ export class MealRecordsManager {
     const now = getTimestamp();
     const dqConfig = this.getDataQualityConfig();
     const shouldValidate = options?.validate ?? dqConfig.enableValidation ?? true;
+    const timestamp = options?.timestamp || now;
     
     const validationResults: ValidationResult[] = [];
+    let processedTimestamp = timestamp;
+    
+    if (shouldValidate) {
+      const timeValidation = validateTimestamp(timestamp, 'timestamp', dqConfig);
+      if (timeValidation) {
+        const timeResult: ValidationResult = {
+          isValid: false,
+          errors: [],
+          warnings: [],
+        };
+        if (timeValidation.severity === 'error') {
+          timeResult.errors.push(timeValidation);
+        } else {
+          timeResult.warnings.push(timeValidation);
+        }
+        validationResults.push(timeResult);
+        
+        if (!timeResult.isValid && dqConfig.rejectOnError) {
+          throw new Error(`数据校验失败: ${timeValidation.message}`);
+        }
+        
+        if (dqConfig.autoCorrectWarnings && timeResult.warnings.length > 0) {
+          processedTimestamp = now;
+        }
+      }
+    }
+    
     const processedFoods = foods.map(foodItem => {
       if (shouldValidate) {
         const validation = validateMealFoodEntry(
@@ -134,7 +163,7 @@ export class MealRecordsManager {
       id: generateId(),
       userId,
       mealType,
-      timestamp: options?.timestamp || now,
+      timestamp: processedTimestamp,
       foods: foodEntries,
       totalNutrition,
       notes: options?.notes,
@@ -841,6 +870,16 @@ export class MealRecordsManager {
     const result = await createBatchResult(mealData, async (item, index) => {
       const allErrors: ValidationError[] = [];
       const allWarnings: ValidationError[] = [];
+      const timestamp = item.options?.timestamp || Date.now();
+      
+      const timeValidation = validateTimestamp(timestamp, 'timestamp', dqConfig);
+      if (timeValidation) {
+        if (timeValidation.severity === 'error') {
+          allErrors.push(timeValidation);
+        } else {
+          allWarnings.push(timeValidation);
+        }
+      }
       
       for (const foodItem of item.foods) {
         const validation = validateMealFoodEntry(
