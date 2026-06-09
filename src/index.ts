@@ -10,6 +10,7 @@ import { convertUnit } from './utils/helpers';
 
 export * from './types';
 export * from './utils/helpers';
+export * from './adapters/InMemoryStorageAdapter';
 
 export class HealthNutritionSDK {
   private config: SDKConfig;
@@ -56,10 +57,6 @@ export class HealthNutritionSDK {
 
   getConfig(): SDKConfig {
     return { ...this.config };
-  }
-
-  convertUnit(value: number, fromUnit: UnitType, toUnit: UnitType): number {
-    return convertUnit(value, fromUnit, toUnit);
   }
 
   updateConfig(config: Partial<SDKConfig>): void {
@@ -218,6 +215,30 @@ export class HealthNutritionSDK {
       ...reminderResult,
       ...alertResult,
     };
+  }
+
+  async exportReport(
+    report: import('./types').WeeklyReport | import('./types').MonthlyReport,
+    format: 'json' | 'text' = 'json',
+    desensitizeOptions?: import('./types').DesensitizeOptions
+  ): Promise<string> {
+    return this.reportGeneration.exportReport(report, format, desensitizeOptions);
+  }
+
+  async exportDesensitizedReport(
+    report: import('./types').WeeklyReport | import('./types').MonthlyReport,
+    format: 'json' | 'text' = 'json',
+    options?: import('./types').DesensitizeOptions
+  ): Promise<string> {
+    return this.reportGeneration.exportDesensitizedReport(report, format, options);
+  }
+
+  convertUnit(
+    value: number,
+    fromUnit: import('./types').UnitType,
+    toUnit: import('./types').UnitType
+  ): number {
+    return convertUnit(value, fromUnit, toUnit);
   }
 }
 

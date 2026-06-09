@@ -111,6 +111,8 @@ export interface MealFoodEntry {
   foodName: string;
   quantity: number;
   unit: UnitType;
+  normalizedQuantity: number;
+  normalizedUnit: UnitType;
   nutritionFacts: NutritionFacts;
 }
 
@@ -131,6 +133,7 @@ export interface WeightRecord {
   userId: string;
   weight: number;
   unit: UnitType;
+  normalizedWeightKg: number;
   timestamp: number;
   note?: string;
   bodyFat?: number;
@@ -144,8 +147,10 @@ export interface WaterRecord {
   userId: string;
   amount: number;
   unit: UnitType;
+  normalizedAmountMl: number;
   timestamp: number;
   cupSize?: number;
+  cups?: number;
 }
 
 export interface UserProfile {
@@ -225,6 +230,14 @@ export interface FoodCombination {
   totalNutrition: NutritionFacts;
 }
 
+export interface DailyCheckInDetail {
+  date: number;
+  mealCount: number;
+  targetMeals: number;
+  status: 'empty' | 'partial' | 'complete';
+  description: string;
+}
+
 export interface WeeklyReport {
   userId: string;
   startDate: number;
@@ -244,9 +257,25 @@ export interface WeeklyReport {
   checkInDays: number;
   checkInStreak: number;
   missedMeals: number;
-  nutrientGaps: { nutrient: string; gap: number; suggestion: string }[];
-  abnormalFluctuations: { date: number; weightChange: number; description: string }[];
+  dailyCheckInDetails: DailyCheckInDetail[];
+  nutrientGaps: { nutrient: string; gap: number; suggestion: string; percentage: number }[];
+  abnormalFluctuations: { date: number; weightChange: number; description: string; possibleReasons: string[] }[];
   weeklySummary: string;
+  suggestions: string[];
+}
+
+export interface MonthlyReport {
+  userId: string;
+  startDate: number;
+  endDate: number;
+  averageDailyCalories: number;
+  averageDailyNutrition: NutritionFacts;
+  calorieGoalAchievement: number;
+  weightTrend: number[];
+  weightChange: number;
+  checkInDays: number;
+  checkInStreak: number;
+  summary: string;
   suggestions: string[];
 }
 

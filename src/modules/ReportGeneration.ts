@@ -19,22 +19,11 @@ import {
   getDaysDiff,
   convertUnit,
   formatDate,
+  normalizeVolumeToMl,
+  normalizeWeightToKg,
+  desensitizeWeeklyReport,
 } from '../utils/helpers';
-
-interface MonthlyReport {
-  userId: string;
-  startDate: number;
-  endDate: number;
-  averageDailyCalories: number;
-  averageDailyNutrition: any;
-  calorieGoalAchievement: number;
-  weightTrend: number[];
-  weightChange: number;
-  checkInDays: number;
-  checkInStreak: number;
-  summary: string;
-  suggestions: string[];
-}
+import type { DesensitizeOptions, MonthlyReport } from '../types';
 
 export class ReportGenerationManager {
   private config: SDKConfig;
@@ -75,6 +64,7 @@ export class ReportGenerationManager {
     const nutrientGaps = this.calculateNutrientGaps(avgNutrition, goals);
     const abnormalFluctuations = this.detectAbnormalFluctuations(weightRecords, weekStart, weekEnd);
     const missedMeals = this.calculateMissedMeals(weekMeals, goals.mealFrequency, weekStart, weekEnd);
+    const dailyCheckInDetails = this.calculateDailyCheckInDetails(weekMeals, weekStart, weekEnd, goals.mealFrequency);
 
     const weeklySummary = this.generateWeeklySummary(
       avgNutrition,
@@ -126,6 +116,7 @@ export class ReportGenerationManager {
       checkInDays: checkInStatus.checkInDays,
       checkInStreak: checkInStatus.currentStreak,
       missedMeals,
+      dailyCheckInDetails,
       nutrientGaps,
       abnormalFluctuations,
       weeklySummary,
@@ -158,7 +149,7 @@ export class ReportGenerationManager {
   }
 
   private calculateDailyWater(
-    waterRecords: { date: number; amount: number; unit: UnitType }[],
+    waterRecords: { date: number; amount: number; unit: UnitType; normalizedAmountMl?: number }[],
     startDate: number,
     endDate: number
   ): Array<{ date: number; amount: number }> {
@@ -171,16 +162,12 @@ export class ReportGenerationManager {
 
       let totalMl = 0;
       for (const record of dayRecords) {
-        let amountMl = record.amount;
-        if (record.unit === UnitType.LITER) {
-          amountMl = record.amount * 1000;
-        } else if (record.unit === UnitType.CUP) {
-          amountMl = record.amount * 240;
-        }
-        totalMl += amountMl;
+        totalMl += record.normalizedAmountMl !== undefined 
+          ? record.normalizedAmountMl 
+          : normalizeVolumeToMl(record.amount, record.unit);
       }
 
-      dailyWater.push({ date: day, amount: totalMl });
+      dailyWater.push({ date: day, amount: totalMl > 0 ? roundTo(totalMl, 2) : 0 });
     }
 
     return dailyWater;
@@ -281,7 +268,7 @@ export class ReportGenerationManager {
       const dayRecords = weightRecords.filter(w => w.timestamp >= day && w.timestamp <= dayEnd);
 
       if (dayRecords.length > 0) {
-        const avgWeight = dayRecords.reduce((acc, w) => acc + w.weight, 0) / dayRecords.length;
+        const avgWeight = dayRecords.reduce((acc, w) => acc + (w.normalizedWeightKg || normalizeWeightToKg(w.weight, w.unit)), 0) / dayRecords.length;
         trend.push(roundTo(avgWeight, 2));
       } else {
         trend.push(0);
@@ -298,24 +285,17 @@ export class ReportGenerationManager {
     const first = sorted[0];
     const last = sorted[sorted.length - 1];
 
-    let firstKg = first.weight;
-    let lastKg = last.weight;
+    const firstKg = first.normalizedWeightKg || normalizeWeightToKg(first.weight, first.unit);
+    const lastKg = last.normalizedWeightKg || normalizeWeightToKg(last.weight, last.unit);
 
-    if (first.unit === UnitType.POUND) {
-      firstKg = convertUnit(first.weight, UnitType.POUND, UnitType.KILOGRAM);
-    }
-    if (last.unit === UnitType.POUND) {
-      lastKg = convertUnit(last.weight, UnitType.POUND, UnitType.KILOGRAM);
-    }
-
-    return lastKg - firstKg;
+    return roundTo(lastKg - firstKg, 2);
   }
 
   private calculateNutrientGaps(
     avgNutrition: any,
     goals: UserGoals
-  ): Array<{ nutrient: string; gap: number; suggestion: string }> {
-    const gaps: Array<{ nutrient: string; gap: number; suggestion: string }> = [];
+  ): Array<{ nutrient: string; gap: number; suggestion: string; percentage: number }> {
+    const gaps: Array<{ nutrient: string; gap: number; suggestion: string; percentage: number }> = [];
 
     const nutrientMap = [
       { key: 'protein', target: goals.dailyProtein, name: '蛋白质', suggestion: '建议增加鸡胸肉、鱼类、豆类等高蛋白食物' },
@@ -326,13 +306,14 @@ export class ReportGenerationManager {
 
     for (const { key, target, name, suggestion } of nutrientMap) {
       const current = avgNutrition[key] || 0;
-      const percentage = target > 0 ? (current / target) * 100 : 100;
+      const percentage = target > 0 ? roundTo((current / target) * 100, 1) : 0;
 
       if (percentage < 80) {
         gaps.push({
           nutrient: name,
           gap: roundTo(target - current, 1),
           suggestion,
+          percentage,
         });
       }
     }
@@ -340,12 +321,52 @@ export class ReportGenerationManager {
     return gaps;
   }
 
+  private calculateDailyCheckInDetails(
+    meals: MealRecord[],
+    startDate: number,
+    endDate: number,
+    targetMealsPerDay: number
+  ): Array<import('../types').DailyCheckInDetail> {
+    const details: Array<import('../types').DailyCheckInDetail> = [];
+    const dayMs = 24 * 60 * 60 * 1000;
+
+    for (let day = startDate; day <= endDate; day += dayMs) {
+      const dayEnd = getEndOfDay(day);
+      const dayMeals = meals.filter(m => m.timestamp >= day && m.timestamp <= dayEnd);
+      const mealCount = dayMeals.length;
+      
+      let status: 'empty' | 'partial' | 'complete' = 'empty';
+      let description = '';
+
+      if (mealCount === 0) {
+        status = 'empty';
+        description = '今日未记录任何餐次';
+      } else if (mealCount < targetMealsPerDay) {
+        status = 'partial';
+        description = `今日记录${mealCount}餐，目标${targetMealsPerDay}餐，还差${targetMealsPerDay - mealCount}餐`;
+      } else {
+        status = 'complete';
+        description = `今日记录${mealCount}餐，已完成目标${targetMealsPerDay}餐`;
+      }
+
+      details.push({
+        date: day,
+        mealCount,
+        targetMeals: targetMealsPerDay,
+        status,
+        description,
+      });
+    }
+
+    return details;
+  }
+
   private detectAbnormalFluctuations(
     weightRecords: WeightRecord[],
     startDate: number,
     endDate: number
-  ): Array<{ date: number; weightChange: number; description: string }> {
-    const fluctuations: Array<{ date: number; weightChange: number; description: string }> = [];
+  ): Array<{ date: number; weightChange: number; description: string; possibleReasons: string[] }> {
+    const fluctuations: Array<{ date: number; weightChange: number; description: string; possibleReasons: string[] }> = [];
 
     const sortedRecords = weightRecords
       .filter(w => w.timestamp >= startDate - 7 * 24 * 60 * 60 * 1000 && w.timestamp <= endDate)
@@ -355,15 +376,8 @@ export class ReportGenerationManager {
       const prev = sortedRecords[i - 1];
       const curr = sortedRecords[i];
 
-      let prevKg = prev.weight;
-      let currKg = curr.weight;
-
-      if (prev.unit === UnitType.POUND) {
-        prevKg = convertUnit(prev.weight, UnitType.POUND, UnitType.KILOGRAM);
-      }
-      if (curr.unit === UnitType.POUND) {
-        currKg = convertUnit(curr.weight, UnitType.POUND, UnitType.KILOGRAM);
-      }
+      const prevKg = prev.normalizedWeightKg || normalizeWeightToKg(prev.weight, prev.unit);
+      const currKg = curr.normalizedWeightKg || normalizeWeightToKg(curr.weight, curr.unit);
 
       const change = currKg - prevKg;
       const daysDiff = getDaysDiff(curr.timestamp, prev.timestamp);
@@ -371,10 +385,28 @@ export class ReportGenerationManager {
 
       if (Math.abs(dailyChange) > 0.5) {
         let description = '';
+        let possibleReasons: string[] = [];
+        
         if (dailyChange > 0.5) {
-          description = `体重快速增加${roundTo(Math.abs(change), 2)}kg，可能是水分滞留或饮食变化`;
+          description = `体重在${daysDiff}天内快速增加${roundTo(Math.abs(change), 2)}kg（日均${roundTo(Math.abs(dailyChange), 2)}kg）`;
+          possibleReasons = [
+            '饮食量突然增加',
+            '盐分摄入过多导致水分滞留',
+            '生理期水肿（女性）',
+            '运动量明显减少',
+            '药物副作用',
+            '甲状腺功能变化'
+          ];
         } else {
-          description = `体重快速下降${roundTo(Math.abs(change), 2)}kg，建议关注是否有健康问题`;
+          description = `体重在${daysDiff}天内快速下降${roundTo(Math.abs(change), 2)}kg（日均${roundTo(Math.abs(dailyChange), 2)}kg）`;
+          possibleReasons = [
+            '饮食量大幅减少',
+            '运动量突然增加',
+            '腹泻或呕吐',
+            '压力过大或焦虑',
+            '甲状腺功能亢进',
+            '糖尿病等代谢疾病'
+          ];
         }
 
         if (curr.timestamp >= startDate) {
@@ -382,6 +414,7 @@ export class ReportGenerationManager {
             date: curr.timestamp,
             weightChange: roundTo(change, 2),
             description,
+            possibleReasons,
           });
         }
       }
@@ -578,34 +611,62 @@ export class ReportGenerationManager {
     return suggestions;
   }
 
-  async exportReport(report: WeeklyReport | MonthlyReport, format: 'json' | 'text' = 'json'): Promise<string> {
+  async exportReport(
+    report: WeeklyReport | MonthlyReport, 
+    format: 'json' | 'text' = 'json',
+    desensitizeOptions?: DesensitizeOptions
+  ): Promise<string> {
+    const finalReport = desensitizeOptions 
+      ? desensitizeWeeklyReport(report, desensitizeOptions) 
+      : report;
+
     if (format === 'json') {
-      return JSON.stringify(report, null, 2);
+      return JSON.stringify(finalReport, null, 2);
     }
 
     const lines: string[] = [];
     lines.push('=== 健康报告 ===');
-    lines.push(`周期: ${formatDate(report.startDate)} - ${formatDate(report.endDate)}`);
-    lines.push(`平均每日热量: ${report.averageDailyCalories} 大卡`);
-    lines.push(`热量目标达成: ${report.calorieGoalAchievement}%`);
-    lines.push(`体重变化: ${report.weightChange >= 0 ? '+' : ''}${report.weightChange} kg`);
-    lines.push(`打卡天数: ${report.checkInDays} 天`);
-    lines.push(`连续打卡: ${report.checkInStreak} 天`);
+    lines.push(`周期: ${formatDate(finalReport.startDate)} - ${formatDate(finalReport.endDate)}`);
+    lines.push(`平均每日热量: ${finalReport.averageDailyCalories} 大卡`);
+    lines.push(`热量目标达成: ${finalReport.calorieGoalAchievement}%`);
+    lines.push(`体重变化: ${finalReport.weightChange >= 0 ? '+' : ''}${finalReport.weightChange} kg`);
+    lines.push(`打卡天数: ${finalReport.checkInDays} 天`);
+    lines.push(`连续打卡: ${finalReport.checkInStreak} 天`);
 
-    if ('weeklySummary' in report) {
+    if ('weeklySummary' in finalReport) {
       lines.push('');
-      lines.push('周总结: ' + report.weeklySummary);
+      lines.push('周总结: ' + finalReport.weeklySummary);
     }
 
-    if ('suggestions' in report) {
+    if ('suggestions' in finalReport) {
       lines.push('');
       lines.push('建议:');
-      for (const [i, suggestion] of report.suggestions.entries()) {
+      for (const [i, suggestion] of finalReport.suggestions.entries()) {
         lines.push(`${i + 1}. ${suggestion}`);
       }
     }
 
+    if (desensitizeOptions) {
+      lines.push('');
+      lines.push('* 本报告已进行数据脱敏处理');
+    }
+
     return lines.join('\n');
+  }
+
+  async exportDesensitizedReport(
+    report: WeeklyReport | MonthlyReport,
+    format: 'json' | 'text' = 'json',
+    options: DesensitizeOptions = {
+      maskUserId: true,
+      maskWeight: true,
+      maskHeight: true,
+      maskBirthDate: true,
+      maskAllergies: true,
+      maskMedicalInfo: true,
+    }
+  ): Promise<string> {
+    return this.exportReport(report, format, options);
   }
 
   async generateComparisonReport(

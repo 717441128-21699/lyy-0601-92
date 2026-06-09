@@ -1,6 +1,61 @@
 import dayjs from 'dayjs';
 import { UnitType, UnitConversionRate, NutritionFacts, DesensitizeOptions, UserProfile } from '../types';
 
+const WEIGHT_UNITS = new Set([
+  UnitType.GRAM,
+  UnitType.KILOGRAM,
+  UnitType.POUND,
+  UnitType.OUNCE
+]);
+
+const VOLUME_UNITS = new Set([
+  UnitType.MILLILITER,
+  UnitType.LITER,
+  UnitType.CUP,
+  UnitType.TABLESPOON,
+  UnitType.TEASPOON
+]);
+
+export const isWeightUnit = (unit: UnitType): boolean => WEIGHT_UNITS.has(unit);
+export const isVolumeUnit = (unit: UnitType): boolean => VOLUME_UNITS.has(unit);
+
+export const normalizeWeightToGrams = (value: number, unit: UnitType): number => {
+  if (!isWeightUnit(unit)) {
+    return value;
+  }
+  try {
+    return convertUnit(value, unit, UnitType.GRAM);
+  } catch {
+    return value;
+  }
+};
+
+export const normalizeWeightToKg = (value: number, unit: UnitType): number => {
+  if (!isWeightUnit(unit)) {
+    return value;
+  }
+  try {
+    return convertUnit(value, unit, UnitType.KILOGRAM);
+  } catch {
+    return value;
+  }
+};
+
+export const normalizeVolumeToMl = (value: number, unit: UnitType): number => {
+  if (!isVolumeUnit(unit)) {
+    return value;
+  }
+  try {
+    return convertUnit(value, unit, UnitType.MILLILITER);
+  } catch {
+    return value;
+  }
+};
+
+export const calculateCupsFromMl = (ml: number, cupSize: number = 240): number => {
+  return roundTo(ml / cupSize, 1);
+};
+
 export const generateId = (): string => {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 };
@@ -34,6 +89,10 @@ const unitConversionRates: UnitConversionRate[] = [
   { from: UnitType.GRAM, to: UnitType.KILOGRAM, rate: 0.001 },
   { from: UnitType.KILOGRAM, to: UnitType.POUND, rate: 2.20462 },
   { from: UnitType.POUND, to: UnitType.KILOGRAM, rate: 0.453592 },
+  { from: UnitType.POUND, to: UnitType.GRAM, rate: 453.592 },
+  { from: UnitType.GRAM, to: UnitType.POUND, rate: 0.00220462 },
+  { from: UnitType.KILOGRAM, to: UnitType.OUNCE, rate: 35.274 },
+  { from: UnitType.OUNCE, to: UnitType.KILOGRAM, rate: 0.0283495 },
   { from: UnitType.POUND, to: UnitType.OUNCE, rate: 16 },
   { from: UnitType.OUNCE, to: UnitType.POUND, rate: 0.0625 },
   { from: UnitType.GRAM, to: UnitType.OUNCE, rate: 0.035274 },
@@ -186,6 +245,41 @@ const maskNumber = (num: number, precision: number = 1): number => {
   return Math.round(num * Math.pow(10, precision)) / Math.pow(10, precision);
 };
 
+const maskWeightForPrivacy = (weight: number): string => {
+  const bmiCategories = [
+    { max: 40, label: '极轻体重' },
+    { max: 50, label: '较轻体重' },
+    { max: 60, label: '标准偏轻' },
+    { max: 70, label: '标准体重' },
+    { max: 80, label: '标准偏重' },
+    { max: 90, label: '较重体重' },
+    { max: 100, label: '肥胖' },
+    { max: Infinity, label: '严重肥胖' },
+  ];
+  const category = bmiCategories.find(c => weight < c.max);
+  return category?.label || '体重范围保密';
+};
+
+const maskHeightForPrivacy = (height: number): string => {
+  if (height < 150) return '较矮身高';
+  if (height < 160) return '中等偏矮';
+  if (height < 170) return '中等身高';
+  if (height < 180) return '中等偏高';
+  if (height < 190) return '较高身高';
+  return '身高范围保密';
+};
+
+const maskAgeForPrivacy = (birthDate: number): string => {
+  const age = Math.floor((Date.now() - birthDate) / (365.25 * 24 * 60 * 60 * 1000));
+  if (age < 18) return '未成年人';
+  if (age < 25) return '青年早期';
+  if (age < 35) return '青年';
+  if (age < 45) return '中青年';
+  if (age < 55) return '中年';
+  if (age < 65) return '中老年';
+  return '老年';
+};
+
 export const desensitizeUserProfile = (
   profile: UserProfile,
   options: DesensitizeOptions = {}
@@ -197,27 +291,80 @@ export const desensitizeUserProfile = (
   }
 
   if (options.maskWeight && profile.weight !== undefined) {
-    result.weight = maskNumber(profile.weight, 0);
+    (result as any).weightRange = maskWeightForPrivacy(profile.weight);
+    delete result.weight;
+    delete result.weightUnit;
   }
 
   if (options.maskHeight && profile.height !== undefined) {
-    result.height = maskNumber(profile.height, 0);
+    (result as any).heightRange = maskHeightForPrivacy(profile.height);
+    delete result.height;
+    delete result.heightUnit;
   }
 
   if (options.maskBirthDate && profile.birthDate !== undefined) {
-    const year = new Date(profile.birthDate).getFullYear();
-    result.birthDate = new Date(year, 0, 1).getTime();
+    (result as any).ageGroup = maskAgeForPrivacy(profile.birthDate);
+    delete result.birthDate;
   }
 
   if (options.maskAllergies) {
-    result.allergies = profile.allergies?.map(() => '***' as any);
+    (result as any).allergyCount = profile.allergies?.length || 0;
+    delete result.allergies;
   }
 
   if (options.maskMedicalInfo) {
-    result.medicalConditions = profile.medicalConditions?.map(() => '***');
-    result.medications = profile.medications?.map(() => '***');
+    (result as any).hasMedicalConditions = (profile.medicalConditions?.length || 0) > 0;
+    (result as any).medicationCount = profile.medications?.length || 0;
+    delete result.medicalConditions;
+    delete result.medications;
   }
 
+  return result;
+};
+
+export const desensitizeWeightRecord = (
+  record: any,
+  options: DesensitizeOptions = {}
+): any => {
+  const result = { ...record };
+  
+  if (options.maskWeight) {
+    (result as any).weightRange = maskWeightForPrivacy(record.normalizedWeightKg || record.weight);
+    delete result.weight;
+    delete result.unit;
+    delete result.normalizedWeightKg;
+    delete result.bodyFat;
+    delete result.muscleMass;
+    delete result.waterWeight;
+    delete result.boneMass;
+  }
+  
+  return result;
+};
+
+export const desensitizeWeeklyReport = (
+  report: any,
+  options: DesensitizeOptions = {}
+): any => {
+  const result = { ...report };
+  
+  if (options.maskUserId !== false) {
+    result.userId = maskString(report.userId);
+  }
+  
+  if (options.maskWeight) {
+    result.weightTrend = report.weightTrend.map((w: number) => 
+      w > 0 ? roundTo(w, 0) : 0
+    );
+    result.weightChange = roundTo(result.weightChange, 0);
+    
+    result.abnormalFluctuations = report.abnormalFluctuations.map((f: any) => ({
+      ...f,
+      weightChange: roundTo(f.weightChange, 0),
+      description: f.description.replace(/[\d.]+kg/g, 'XXkg'),
+    }));
+  }
+  
   return result;
 };
 

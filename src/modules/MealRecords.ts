@@ -19,6 +19,14 @@ import {
   getEndOfDay,
   isSameDay,
   groupBy,
+  convertUnit,
+  normalizeWeightToGrams,
+  normalizeVolumeToMl,
+  normalizeWeightToKg,
+  calculateCupsFromMl,
+  isWeightUnit,
+  isVolumeUnit,
+  roundTo,
 } from '../utils/helpers';
 
 export class MealRecordsManager {
@@ -41,16 +49,38 @@ export class MealRecordsManager {
   ): Promise<MealRecord> {
     const now = getTimestamp();
     const foodEntries: MealFoodEntry[] = foods.map(({ food, quantity, unit }) => {
+      let normalizedQuantity = quantity;
+      let normalizedUnit = unit;
+      
+      if (isWeightUnit(unit) && isWeightUnit(food.servingUnit)) {
+        normalizedQuantity = roundTo(normalizeWeightToGrams(quantity, unit), 2);
+        normalizedUnit = UnitType.GRAM;
+      } else if (isVolumeUnit(unit) && isVolumeUnit(food.servingUnit)) {
+        normalizedQuantity = roundTo(normalizeVolumeToMl(quantity, unit), 2);
+        normalizedUnit = UnitType.MILLILITER;
+      } else if (unit !== food.servingUnit) {
+        try {
+          normalizedQuantity = roundTo(convertUnit(quantity, unit, food.servingUnit), 2);
+          normalizedUnit = food.servingUnit;
+        } catch {
+          normalizedQuantity = quantity;
+          normalizedUnit = unit;
+        }
+      }
+      
       const nutrition = calculateNutritionForQuantity(
         food.nutritionFacts,
         food.servingSize,
-        quantity
+        normalizedQuantity
       );
+      
       return {
         foodId: food.id,
         foodName: food.name,
         quantity,
         unit,
+        normalizedQuantity,
+        normalizedUnit,
         nutritionFacts: nutrition,
       };
     });
@@ -113,16 +143,37 @@ export class MealRecordsManager {
 
     if (updates.foods) {
       foodEntries = updates.foods.map(({ food, quantity, unit }) => {
+        let normalizedQuantity = quantity;
+        let normalizedUnit = unit;
+        
+        if (isWeightUnit(unit) && isWeightUnit(food.servingUnit)) {
+          normalizedQuantity = roundTo(normalizeWeightToGrams(quantity, unit), 2);
+          normalizedUnit = UnitType.GRAM;
+        } else if (isVolumeUnit(unit) && isVolumeUnit(food.servingUnit)) {
+          normalizedQuantity = roundTo(normalizeVolumeToMl(quantity, unit), 2);
+          normalizedUnit = UnitType.MILLILITER;
+        } else if (unit !== food.servingUnit) {
+          try {
+            normalizedQuantity = roundTo(convertUnit(quantity, unit, food.servingUnit), 2);
+            normalizedUnit = food.servingUnit;
+          } catch {
+            normalizedQuantity = quantity;
+            normalizedUnit = unit;
+          }
+        }
+        
         const nutrition = calculateNutritionForQuantity(
           food.nutritionFacts,
           food.servingSize,
-          quantity
+          normalizedQuantity
         );
         return {
           foodId: food.id,
           foodName: food.name,
           quantity,
           unit,
+          normalizedQuantity,
+          normalizedUnit,
           nutritionFacts: nutrition,
         };
       });
@@ -208,10 +259,29 @@ export class MealRecordsManager {
     const meal = await this.getMealRecord(userId, mealId);
     if (!meal) return null;
 
+    let normalizedQuantity = quantity;
+    let normalizedUnit = unit;
+    
+    if (isWeightUnit(unit) && isWeightUnit(food.servingUnit)) {
+      normalizedQuantity = roundTo(normalizeWeightToGrams(quantity, unit), 2);
+      normalizedUnit = UnitType.GRAM;
+    } else if (isVolumeUnit(unit) && isVolumeUnit(food.servingUnit)) {
+      normalizedQuantity = roundTo(normalizeVolumeToMl(quantity, unit), 2);
+      normalizedUnit = UnitType.MILLILITER;
+    } else if (unit !== food.servingUnit) {
+      try {
+        normalizedQuantity = roundTo(convertUnit(quantity, unit, food.servingUnit), 2);
+        normalizedUnit = food.servingUnit;
+      } catch {
+        normalizedQuantity = quantity;
+        normalizedUnit = unit;
+      }
+    }
+
     const nutrition = calculateNutritionForQuantity(
       food.nutritionFacts,
       food.servingSize,
-      quantity
+      normalizedQuantity
     );
 
     const foodEntry: MealFoodEntry = {
@@ -219,6 +289,8 @@ export class MealRecordsManager {
       foodName: food.name,
       quantity,
       unit,
+      normalizedQuantity,
+      normalizedUnit,
       nutritionFacts: nutrition,
     };
 
@@ -273,13 +345,19 @@ export class MealRecordsManager {
     unit: UnitType = UnitType.MILLILITER,
     options?: { timestamp?: number; cupSize?: number }
   ): Promise<WaterRecord> {
+    const normalizedAmountMl = roundTo(normalizeVolumeToMl(amount, unit), 2);
+    const cupSize = options?.cupSize || 240;
+    const cups = calculateCupsFromMl(normalizedAmountMl, cupSize);
+    
     const record: WaterRecord = {
       id: generateId(),
       userId,
       amount,
       unit,
+      normalizedAmountMl,
       timestamp: options?.timestamp || getTimestamp(),
-      cupSize: options?.cupSize,
+      cupSize,
+      cups,
     };
 
     this.waterRecords.set(record.id, record);
@@ -317,31 +395,22 @@ export class MealRecordsManager {
     return records.sort((a, b) => b.timestamp - a.timestamp);
   }
 
-  async getWaterIntakeByDate(userId: string, date: number): Promise<{ amount: number; unit: UnitType; cups: number }> {
+  async getWaterIntakeByDate(userId: string, date: number): Promise<{ amount: number; unit: UnitType; cups: number; totalMl: number; totalCups: number }> {
     const records = await this.getWaterRecords(userId, getStartOfDay(date), getEndOfDay(date));
     let totalMl = 0;
     let totalCups = 0;
 
     for (const record of records) {
-      let amountMl = record.amount;
-      if (record.unit === UnitType.LITER) {
-        amountMl = record.amount * 1000;
-      } else if (record.unit === UnitType.CUP) {
-        amountMl = record.amount * 240;
-      }
-      totalMl += amountMl;
-
-      if (record.cupSize) {
-        totalCups += record.amount / record.cupSize;
-      } else {
-        totalCups += Math.ceil(amountMl / 240);
-      }
+      totalMl += record.normalizedAmountMl;
+      totalCups += record.cups || 0;
     }
 
     return {
-      amount: totalMl,
+      amount: roundTo(totalMl, 2),
       unit: UnitType.MILLILITER,
-      cups: Math.round(totalCups * 10) / 10,
+      cups: roundTo(totalCups, 1),
+      totalMl,
+      totalCups: roundTo(totalCups, 1),
     };
   }
 
@@ -358,11 +427,14 @@ export class MealRecordsManager {
       boneMass?: number;
     }
   ): Promise<WeightRecord> {
+    const normalizedWeightKg = roundTo(normalizeWeightToKg(weight, unit), 2);
+    
     const record: WeightRecord = {
       id: generateId(),
       userId,
       weight,
       unit,
+      normalizedWeightKg,
       timestamp: options?.timestamp || getTimestamp(),
       note: options?.note,
       bodyFat: options?.bodyFat,
@@ -415,7 +487,8 @@ export class MealRecordsManager {
     this.favorites.add(`${userId}:${foodId}`);
 
     if (this.config.storageAdapter) {
-      const favorites = await this.getFavoriteFoods(userId);
+      const stored = await this.config.storageAdapter.get<string[]>(`favorites:${userId}`);
+      const favorites = stored || [];
       if (!favorites.includes(foodId)) {
         favorites.push(foodId);
         await this.config.storageAdapter.set(`favorites:${userId}`, favorites);
@@ -464,16 +537,37 @@ export class MealRecordsManager {
     mealType: MealType
   ): Promise<FoodCombination> {
     const foodEntries: MealFoodEntry[] = foods.map(({ food, quantity, unit }) => {
+      let normalizedQuantity = quantity;
+      let normalizedUnit = unit;
+      
+      if (isWeightUnit(unit) && isWeightUnit(food.servingUnit)) {
+        normalizedQuantity = roundTo(normalizeWeightToGrams(quantity, unit), 2);
+        normalizedUnit = UnitType.GRAM;
+      } else if (isVolumeUnit(unit) && isVolumeUnit(food.servingUnit)) {
+        normalizedQuantity = roundTo(normalizeVolumeToMl(quantity, unit), 2);
+        normalizedUnit = UnitType.MILLILITER;
+      } else if (unit !== food.servingUnit) {
+        try {
+          normalizedQuantity = roundTo(convertUnit(quantity, unit, food.servingUnit), 2);
+          normalizedUnit = food.servingUnit;
+        } catch {
+          normalizedQuantity = quantity;
+          normalizedUnit = unit;
+        }
+      }
+      
       const nutrition = calculateNutritionForQuantity(
         food.nutritionFacts,
         food.servingSize,
-        quantity
+        normalizedQuantity
       );
       return {
         foodId: food.id,
         foodName: food.name,
         quantity,
         unit,
+        normalizedQuantity,
+        normalizedUnit,
         nutritionFacts: nutrition,
       };
     });
@@ -524,7 +618,16 @@ export class MealRecordsManager {
   }
 
   async useFoodCombination(userId: string, combinationId: string): Promise<MealRecord | null> {
-    const combo = this.foodCombinations.get(combinationId);
+    let combo = this.foodCombinations.get(combinationId);
+    
+    if (!combo && this.config.storageAdapter) {
+      const stored = await this.config.storageAdapter.get<FoodCombination>(`combination:${userId}:${combinationId}`);
+      if (stored) {
+        combo = stored;
+        this.foodCombinations.set(combinationId, combo);
+      }
+    }
+    
     if (!combo || combo.userId !== userId) return null;
 
     combo.usageCount++;
